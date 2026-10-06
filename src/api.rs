@@ -23,6 +23,7 @@ use anyhow::Result;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::auth::Auth;
 use crate::geo::Cell;
 
 pub const SEARCH_URL: &str = "https://www.geocaching.com/api/proxy/web/search/v2";

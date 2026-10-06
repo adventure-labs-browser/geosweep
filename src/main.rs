@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     let db = db::Db::open(&cli.db)?;
 
     async fn authed(rate: f64, username: &str, password: &str) -> Result<api::Client> {
-        let auth = std::sync::Arc::new(auth::login(username, password).await?);
+        let auth = std::sync::Arc::new(auth::Auth::login(username, password).await?);
         println!("logged in");
         api::Client::new(rate, auth)
     }
@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Auth { username, password } => {
-            auth::login(&username, &password).await?;
+            auth::Auth::login(&username, &password).await?;
             println!("login ok (token in memory only, nothing stored)");
             Ok(())
         }
