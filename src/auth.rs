@@ -1,13 +1,19 @@
 //! geocaching.com website auth: form login -> session cookies ->
-//! OAuth bearer for the api-proxy. Tokens live in memory ONLY (never
-//! written to the db), so there is nothing to strip before upload and
-//! every run logs in fresh from env credentials.
+//! OAuth bearer for the api-proxy, with transparent refresh.
+//!
+//! The website token lives ~1h; a full crawl runs for hours, so the
+//! client re-logs-in proactively before expiry and reactively on 401.
+//! Tokens live in memory ONLY (never written to the db).
+
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 const SIGNIN_URL: &str =
     "https://www.geocaching.com/account/signin?returnUrl=%2Fplay";
 const TOKEN_URL: &str = "https://www.geocaching.com/account/oauth/token";
+/// Refresh ahead of the stated expiry by this much.
+const EXPIRY_SKEW_SECS: u64 = 300;
 
 /// Extract __RequestVerificationToken from the signin page HTML.
 fn extract_token(page: &str) -> Result<String> {
@@ -26,11 +32,65 @@ fn extract_token(page: &str) -> Result<String> {
     Ok(rest[start..start + end].to_string())
 }
 
-/// Username + password -> api-proxy bearer token. Builds its own
-/// cookie-enabled client (the website session lives in cookies).
-pub async fn login(username: &str, password: &str) -> Result<String> {
+struct AuthState {
+    username: String,
+    password: String,
+    token: String,
+    expires_at: Instant,
+}
+
+pub struct Auth {
+    inner: tokio::sync::Mutex<AuthState>,
+}
+
+impl Auth {
+    pub async fn login(username: &str, password: &str) -> Result<Self> {
+        let (token, expires_in) = do_login(username, password).await?;
+        Ok(Self {
+            inner: tokio::sync::Mutex::new(AuthState {
+                username: username.to_string(),
+                password: password.to_string(),
+                token,
+                expires_at: Instant::now()
+                    + Duration::from_secs(expires_in.saturating_sub(EXPIRY_SKEW_SECS)),
+            }),
+        })
+    }
+
+    /// Valid token, refreshing first if stale.
+    pub async fn token(&self) -> Result<String> {
+        {
+            let st = self.inner.lock().await;
+            if Instant::now() < st.expires_at {
+                return Ok(st.token.clone());
+            }
+        }
+        self.refresh().await
+    }
+
+    /// Unconditional re-login (after a 401). Returns the new token.
+    pub async fn force_refresh(&self) -> Result<String> {
+        self.refresh().await
+    }
+
+    async fn refresh(&self) -> Result<String> {
+        let (u, p) = {
+            let st = self.inner.lock().await;
+            (st.username.clone(), st.password.clone())
+        };
+        let (token, expires_in) = do_login(&u, &p).await?;
+        let mut st = self.inner.lock().await;
+        st.token = token.clone();
+        st.expires_at =
+            Instant::now() + Duration::from_secs(expires_in.saturating_sub(EXPIRY_SKEW_SECS));
+        Ok(token)
+    }
+}
+
+/// Full login flow. Returns (bearer token, expires_in seconds).
+async fn do_login(username: &str, password: &str) -> Result<(String, u64)> {
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(Duration::from_secs(60))
         .user_agent(crate::api::USER_AGENT)
         .cookie_store(true)
         .build()?;
@@ -68,17 +128,21 @@ pub async fn login(username: &str, password: &str) -> Result<String> {
             tok_body.chars().take(200).collect::<String>()
         );
     }
-    let tok: serde_json::Value = serde_json::from_str(&tok_body)
-        .with_context(|| {
-            format!(
-                "oauth token json (login post was {login_status}, {} bytes): {}",
-                login_body.len(),
-                tok_body.chars().take(200).collect::<String>()
-            )
-        })?;
+    let tok: serde_json::Value = serde_json::from_str(&tok_body).with_context(|| {
+        format!(
+            "oauth token json (login post was {login_status}, {} bytes): {}",
+            login_body.len(),
+            tok_body.chars().take(200).collect::<String>()
+        )
+    })?;
     let access = tok
         .get("access_token")
         .and_then(|t| t.as_str())
-        .context("oauth response missing access_token")?;
-    Ok(access.to_string())
+        .context("oauth response missing access_token")?
+        .to_string();
+    let expires_in = tok
+        .get("expires_in")
+        .and_then(|e| e.as_u64())
+        .unwrap_or(3600);
+    Ok((access, expires_in))
 }

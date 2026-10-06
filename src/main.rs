@@ -105,9 +105,9 @@ async fn main() -> Result<()> {
     let db = db::Db::open(&cli.db)?;
 
     async fn authed(rate: f64, username: &str, password: &str) -> Result<api::Client> {
-        let bearer = auth::login(username, password).await?;
+        let auth = std::sync::Arc::new(auth::login(username, password).await?);
         println!("logged in");
-        api::Client::new(rate, bearer)
+        api::Client::new(rate, auth)
     }
 
     match cli.cmd {
