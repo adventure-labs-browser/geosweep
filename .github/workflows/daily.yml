@@ -1,0 +1,81 @@
+name: daily
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+
+      - name: Restore database from rolling release
+        run: |
+          mkdir -p data
+          if gh release download db-latest -p 'geosweep.db.zst' --clobber; then
+            zstd -dc geosweep.db.zst -o data/geosweep.db
+            rm -f geosweep.db.zst
+            ls -lh data/geosweep.db
+          else
+            echo "no db-latest release yet — starting from an empty database"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Migrate database
+        run: ./target/release/geosweep --db data/geosweep.db stats
+
+      - name: Refresh pass
+        run: ./target/release/geosweep --db data/geosweep.db refresh
+        env:
+          GC_USER: ${{ secrets.GC_USER }}
+          GC_PASS: ${{ secrets.GC_PASS }}
+
+      - name: Validate database before publish
+        if: always()
+        id: dbcheck
+        run: |
+          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import sqlite3, os
+          ok = False
+          try:
+              assert os.path.getsize('data/geosweep.db') > 100_000
+              db = sqlite3.connect('file:data/geosweep.db?mode=ro', uri=True)
+              assert db.execute('PRAGMA page_count').fetchone()[0] > 0
+              tables = {r[0] for r in db.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'")}
+              assert {'queue', 'caches', 'cache_versions', 'meta'}.issubset(tables)
+              ok = True
+          except Exception as e:
+              print(f'validation failed: {e}')
+          print(f'valid={str(ok).lower()}')
+          PYEOF
+
+      - name: Publish database to rolling release
+        if: always() && steps.dbcheck.outputs.valid == 'true'
+        run: |
+          zstd -T0 data/geosweep.db -o /tmp/geosweep.db.zst
+          ls -lh /tmp/geosweep.db.zst
+          TAG="db-$(date -u +%F)"
+          gh release create "$TAG" /tmp/geosweep.db.zst \
+            --title "geosweep db $(date -u +%F)" \
+            --notes "Dated snapshot, kept 7 days." \
+            || true
+          gh release delete db-latest -y --cleanup-tag || true
+          gh release create db-latest /tmp/geosweep.db.zst \
+            --title "geosweep db $(date -u +%F)" \
+            --notes "Rolling database snapshot."
+          gh release list --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("db-20")) | .tagName] | sort | .[:-7] | .[]' \
+            | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
+        env:
+          GH_TOKEN: ${{ github.token }}
