@@ -87,12 +87,69 @@ pub fn cell_box(cell: &Cell) -> (f64, f64, f64, f64) {
     )
 }
 
+/// Adaptive rate limiter: additive-increase / multiplicative-decrease
+/// on top of a fixed-interval scheduler. Clean requests gradually
+/// tighten the interval (faster); any 429/5xx/timeout doubles it and
+/// honors Retry-After. Converges to just under the server's patience
+/// instead of needing a hand-picked rate.
+struct Adaptive {
+    interval: Duration,
+    since_cut: u64,
+}
+
+const MIN_INTERVAL: Duration = Duration::from_millis(10); // 100/s hard ceiling
+const MAX_INTERVAL: Duration = Duration::from_secs(30);
+const SUCCESSES_PER_STEP: u64 = 50;
+
+impl Adaptive {
+    fn new(rate: f64) -> Self {
+        Self {
+            interval: if rate > 0.0 {
+                Duration::from_secs_f64(1.0 / rate)
+            } else {
+                Duration::ZERO
+            },
+            since_cut: 0,
+        }
+    }
+
+    fn current(&self) -> Duration {
+        self.interval
+    }
+
+    /// Call after a clean request: every SUCCESSES_PER_STEP successes
+    /// shaves a millisecond (additive increase toward the ceiling).
+    fn success(&mut self) {
+        if self.interval.is_zero() {
+            return;
+        }
+        self.since_cut += 1;
+        if self.since_cut >= SUCCESSES_PER_STEP && self.interval > MIN_INTERVAL {
+            self.interval = (self.interval - Duration::from_millis(1)).max(MIN_INTERVAL);
+            self.since_cut = 0;
+        }
+    }
+
+    /// Call on 429/5xx/timeout: double the interval (floor Retry-After).
+    fn cut(&mut self, floor: Duration) {
+        let doubled = self.interval.mul_f64(2.0).max(floor);
+        self.interval = doubled.min(MAX_INTERVAL);
+        self.since_cut = 0;
+        if self.interval >= Duration::from_secs(1) {
+            warn!(
+                "rate limiter backing off to {:.1}/s after throttling",
+                1.0 / self.interval.as_secs_f64()
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     bearer: Arc<Mutex<Option<String>>>,
     next_slot: Arc<Mutex<Instant>>,
-    interval: Duration,
+    adaptive: Arc<Mutex<Adaptive>>,
 }
 
 impl Client {
@@ -105,27 +162,44 @@ impl Client {
             http,
             bearer: Arc::new(Mutex::new(Some(bearer))),
             next_slot: Arc::new(Mutex::new(Instant::now())),
-            interval: if rate > 0.0 {
-                Duration::from_secs_f64(1.0 / rate)
-            } else {
-                Duration::ZERO
-            },
+            adaptive: Arc::new(Mutex::new(Adaptive::new(rate))),
         })
     }
 
     async fn acquire(&self) {
-        if self.interval.is_zero() {
+        let step = self.adaptive.lock().unwrap().current();
+        if step.is_zero() {
             return;
         }
         let wait = {
             let mut next = self.next_slot.lock().unwrap();
             let now = Instant::now();
             let slot = (*next).max(now);
-            *next = slot + self.interval;
+            *next = slot + step;
             slot.saturating_duration_since(now)
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Record a clean request (tightens the schedule).
+    fn note_success(&self) {
+        self.adaptive.lock().unwrap().success();
+    }
+
+    /// Record throttling: double the interval (floor = Retry-After).
+    fn note_limited(&self, retry_after: Duration) {
+        self.adaptive.lock().unwrap().cut(retry_after);
+    }
+
+    /// Current effective requests/sec (moves with AIMD).
+    pub fn rate(&self) -> f64 {
+        let i = self.adaptive.lock().unwrap().current();
+        if i.is_zero() {
+            f64::INFINITY
+        } else {
+            1.0 / i.as_secs_f64()
         }
     }
 
@@ -162,28 +236,32 @@ impl Client {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = format!("network: {e}");
+                    self.note_limited(Duration::ZERO);
                     tokio::time::sleep(Duration::from_secs_f64(BACKOFF.powi(attempt as i32))).await;
                     continue;
                 }
             };
             let status = resp.status().as_u16();
             if status == 200 {
-                return match resp.json::<Value>().await {
-                    Ok(v) => Ok(SearchResp {
-                        total_count: v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
-                        items: v
-                            .get("results")
-                            .and_then(|i| i.as_array())
-                            .cloned()
-                            .unwrap_or_default(),
-                    }),
+                match resp.json::<Value>().await {
+                    Ok(v) => {
+                        self.note_success();
+                        return Ok(SearchResp {
+                            total_count: v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
+                            items: v
+                                .get("results")
+                                .and_then(|i| i.as_array())
+                                .cloned()
+                                .unwrap_or_default(),
+                        });
+                    }
                     Err(e) => {
                         last_err = format!("json: {e}");
                         tokio::time::sleep(Duration::from_secs_f64(BACKOFF.powi(attempt as i32)))
                             .await;
                         continue;
                     }
-                };
+                }
             }
             if status == 401 || status == 403 {
                 let msg = snippet(&resp.text().await.unwrap_or_default(), 200);
@@ -196,6 +274,7 @@ impl Client {
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or_else(|| BACKOFF.powi(attempt as i32));
+                self.note_limited(Duration::from_secs_f64(wait));
                 last_err = format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
                 tokio::time::sleep(Duration::from_secs_f64(wait)).await;
                 continue;
