@@ -19,8 +19,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use serde_json::Value;
-use tracing::warn;
 
 use crate::geo::Cell;
 
@@ -234,9 +234,3 @@ impl Client {
     }
 }
 
-/// Warn helper re-export for stages that only need the limiter math.
-pub fn warn_slow(rate: f64) {
-    if rate > 40.0 {
-        warn!("rate {rate}/s is aggressive; 429s back off automatically");
-    }
-}

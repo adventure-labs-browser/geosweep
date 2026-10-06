@@ -334,7 +334,7 @@ impl Db {
                         .optional()?;
                     match existing {
                         None => {
-                            insert_cache(&tx, &mut ins, guid, item, &raw, &hash)?;
+                            insert_cache(&mut ins, guid, item, &raw, &hash)?;
                             inserted += 1;
                         }
                         Some((_, Some(h))) if h == hash => {}
@@ -514,7 +514,6 @@ fn coords(v: &Value) -> (Option<f64>, Option<f64>) {
 type InsStmt<'a> = rusqlite::Statement<'a>;
 
 fn insert_cache(
-    tx: &rusqlite::Transaction,
     ins: &mut InsStmt,
     guid: &str,
     item: &Value,
