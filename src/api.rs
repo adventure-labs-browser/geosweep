@@ -133,10 +133,11 @@ impl Adaptive {
 
     /// Call on 429/5xx/timeout: double the interval (floor Retry-After).
     fn cut(&mut self, floor: Duration) {
-        let doubled = self.interval.mul_f64(2.0).max(floor);
+        let old = self.interval;
+        let doubled = old.mul_f64(2.0).max(floor);
         self.interval = doubled.min(MAX_INTERVAL);
         self.since_cut = 0;
-        if self.interval >= Duration::from_secs(1) {
+        if self.interval > old && self.interval >= Duration::from_secs(1) {
             warn!(
                 "rate limiter backing off to {:.1}/s after throttling",
                 1.0 / self.interval.as_secs_f64()
@@ -148,20 +149,20 @@ impl Adaptive {
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
-    bearer: Arc<Mutex<Option<String>>>,
+    auth: Arc<Auth>,
     next_slot: Arc<Mutex<Instant>>,
     adaptive: Arc<Mutex<Adaptive>>,
 }
 
 impl Client {
-    pub fn new(rate: f64, bearer: String) -> Result<Self> {
+    pub fn new(rate: f64, auth: Arc<Auth>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .user_agent(USER_AGENT)
             .build()?;
         Ok(Self {
             http,
-            bearer: Arc::new(Mutex::new(Some(bearer))),
+            auth,
             next_slot: Arc::new(Mutex::new(Instant::now())),
             adaptive: Arc::new(Mutex::new(Adaptive::new(rate))),
         })
@@ -194,11 +195,13 @@ impl Client {
         self.adaptive.lock().unwrap().cut(retry_after);
     }
 
-    fn auth_header(&self) -> String {
-        format!(
-            "Bearer {}",
-            self.bearer.lock().unwrap().clone().unwrap_or_default()
-        )
+    async fn auth_header(&self) -> Result<String, ApiError> {
+        let token = self
+            .auth
+            .token()
+            .await
+            .map_err(|e| ApiError::Retries(format!("auth refresh: {e}")))?;
+        Ok(format!("Bearer {token}"))
     }
 
     /// One box page. Retries retriable statuses with backoff.
@@ -214,12 +217,14 @@ impl Client {
              &rad=16000&take={take}&skip={skip}&sort=distance&asc=true&app=geosweep"
         );
         let mut last_err = String::new();
+        let mut refreshed = false;
         for attempt in 0..RETRIES {
             self.acquire().await;
+            let auth = self.auth_header().await?;
             let resp = match self
                 .http
                 .get(&url)
-                .header("Authorization", self.auth_header())
+                .header("Authorization", auth)
                 .header("Accept", "application/json")
                 .send()
                 .await
@@ -233,6 +238,19 @@ impl Client {
                 }
             };
             let status = resp.status().as_u16();
+            if status == 401 && !refreshed {
+                // Token died mid-run: one transparent re-login, then retry.
+                refreshed = true;
+                match self.auth.force_refresh().await {
+                    Ok(_) => continue,
+                    Err(e) => {
+                        return Err(ApiError::Status(
+                            401,
+                            format!("token renewal failed: {e}"),
+                        ))
+                    }
+                }
+            }
             if status == 200 {
                 match resp.json::<Value>().await {
                     Ok(v) => {
@@ -282,10 +300,11 @@ impl Client {
             "{SEARCH_URL}?box=90,-180,-90,180&rad=16000&take=1&skip=0&app=geosweep"
         );
         self.acquire().await;
+        let auth = self.auth_header().await?;
         let resp = self
             .http
             .get(&url)
-            .header("Authorization", self.auth_header())
+            .header("Authorization", auth)
             .header("Accept", "application/json")
             .send()
             .await

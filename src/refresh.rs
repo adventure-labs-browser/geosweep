@@ -17,11 +17,11 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let labs_before = db.labs_count().await?;
     let n = db.requeue_done().await?;
     info!("refresh: {n} crawl cells re-queued");
-    let bearer = crate::auth::login(&args.username, &args.password).await?;
+    let auth = std::sync::Arc::new(crate::auth::login(&args.username, &args.password).await?);
     info!("refresh: logged in, starting crawl");
     crawl::run(
         db.clone(),
-        Client::new(args.crawl_rate, bearer)?,
+        Client::new(args.crawl_rate, auth)?,
         crawl::Args {
             concurrency: 16,
             seeds: 16,
