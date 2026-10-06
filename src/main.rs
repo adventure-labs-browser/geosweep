@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     async fn authed(rate: f64, username: &str, password: &str) -> Result<api::Client> {
         let bearer = auth::login(username, password).await?;
         println!("logged in");
-        Ok(api::Client::new(rate, bearer)?)
+        api::Client::new(rate, bearer)
     }
 
     match cli.cmd {
