@@ -66,7 +66,7 @@ enum Cmd {
         #[arg(long, env = "GC_PASS")]
         password: String,
         /// Max aggregate requests/sec.
-        #[arg(long, default_value_t = 20.0)]
+        #[arg(long, default_value_t = 10.0)]
         crawl_rate: f64,
     },
     /// Print queue/cache counts.
