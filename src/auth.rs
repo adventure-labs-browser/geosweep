@@ -34,17 +34,17 @@ pub async fn login(username: &str, password: &str) -> Result<String> {
         .user_agent(crate::api::USER_AGENT)
         .cookie_store(true)
         .build()?;
-    let page: String = http
-        .get(SIGNIN_URL)
-        .send()
-        .await
-        .context("signin page fetch")?
-        .error_for_status()
-        .context("signin page status")?
-        .text()
-        .await?;
+    let signin_resp = http.get(SIGNIN_URL).send().await.context("signin page fetch")?;
+    let signin_status = signin_resp.status();
+    let page = signin_resp.text().await.unwrap_or_default();
+    if !signin_status.is_success() {
+        anyhow::bail!(
+            "signin page http {signin_status}: {}",
+            page.chars().take(200).collect::<String>()
+        );
+    }
     let token = extract_token(&page)?;
-    let resp = http
+    let login_resp = http
         .post(SIGNIN_URL)
         .form(&[
             ("UsernameOrEmail", username),
@@ -54,17 +54,28 @@ pub async fn login(username: &str, password: &str) -> Result<String> {
         .send()
         .await
         .context("login post")?;
-    let _ = resp.error_for_status().context("login failed")?;
-    let tok: serde_json::Value = http
-        .get(TOKEN_URL)
-        .send()
-        .await
-        .context("oauth token fetch")?
-        .error_for_status()
-        .context("oauth token status (bad credentials?)")?
-        .json()
-        .await
-        .context("oauth token json")?;
+    let login_status = login_resp.status();
+    let login_body = login_resp.text().await.unwrap_or_default();
+    // A 200 can still be a bot-check or failed-login page: the proof is
+    // whether the token endpoint then yields a JWT.
+    let tok_resp = http.get(TOKEN_URL).send().await.context("oauth token fetch")?;
+    let tok_status = tok_resp.status();
+    let tok_body = tok_resp.text().await.unwrap_or_default();
+    if !tok_status.is_success() {
+        anyhow::bail!(
+            "oauth token http {tok_status} (login post was {login_status}, {} bytes): {}",
+            login_body.len(),
+            tok_body.chars().take(200).collect::<String>()
+        );
+    }
+    let tok: serde_json::Value = serde_json::from_str(&tok_body)
+        .with_context(|| {
+            format!(
+                "oauth token json (login post was {login_status}, {} bytes): {}",
+                login_body.len(),
+                tok_body.chars().take(200).collect::<String>()
+            )
+        })?;
     let access = tok
         .get("access_token")
         .and_then(|t| t.as_str())
