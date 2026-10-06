@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::geo::Cell;
 

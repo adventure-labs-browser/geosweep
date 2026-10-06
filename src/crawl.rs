@@ -63,11 +63,15 @@ pub async fn run(db: Db, client: Client, args: Args) -> Result<()> {
     let processed = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(args.concurrency);
-    for _ in 0..args.concurrency {
+    for idx in 0..args.concurrency {
         let (db, client, stop, processed) =
             (db.clone(), client.clone(), stop.clone(), processed.clone());
         let (min_radius, max_cells) = (args.min_radius_m, args.max_cells);
+        // Stagger worker startup so N workers don't burst simultaneously
+        // past the limiter's first slot (thundering herd -> instant 429s).
+        let stagger_ms = (idx as u64) * 250;
         handles.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
             worker(db, client, stop, processed, min_radius, max_cells).await
         }));
     }

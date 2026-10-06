@@ -54,6 +54,10 @@ jobs:
               tables = {r[0] for r in db.execute(
                   "SELECT name FROM sqlite_master WHERE type='table'")}
               assert {'queue', 'caches', 'cache_versions', 'meta'}.issubset(tables)
+              qfailed = db.execute("SELECT COUNT(*) FROM queue WHERE status='failed'").fetchone()[0]
+              ncaches = db.execute('SELECT COUNT(*) FROM caches').fetchone()[0]
+              assert qfailed <= 5, f'{qfailed} failed cells (a few bad cells are tolerated, a wave is not)'
+              assert ncaches > 0, 'zero caches'
               ok = True
           except Exception as e:
               print(f'validation failed: {e}')
