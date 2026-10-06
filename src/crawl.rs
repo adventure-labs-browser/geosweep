@@ -22,7 +22,6 @@ const STALE_CELL_SECS: i64 = 600;
 
 pub struct Args {
     pub concurrency: usize,
-    pub rate: f64,
     pub seeds: usize,
     pub seed_radius_m: f64,
     pub min_radius_m: f64,

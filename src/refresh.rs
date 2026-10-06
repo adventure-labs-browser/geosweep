@@ -24,7 +24,6 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         Client::new(args.crawl_rate, bearer)?,
         crawl::Args {
             concurrency: 16,
-            rate: args.crawl_rate,
             seeds: 16,
             seed_radius_m: 12_000_000.0,
             min_radius_m: 1000.0,

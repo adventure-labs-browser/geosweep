@@ -128,7 +128,6 @@ async fn main() -> Result<()> {
                 client,
                 crawl::Args {
                     concurrency,
-                    rate,
                     seeds,
                     seed_radius_m,
                     min_radius_m,
