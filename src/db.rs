@@ -49,15 +49,13 @@ CREATE TABLE IF NOT EXISTS caches (
     country TEXT,
     raw_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',   -- active (removals: future work)
-    content_hash TEXT,                       -- md5(raw_json); change detection
+    content_hash TEXT,                       -- FNV-1a(raw_json); change detection
     removed_at TEXT,
     version_seq INTEGER NOT NULL DEFAULT 1,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT,
     first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    failed_attempts INTEGER NOT NULL DEFAULT 0,
-    next_retry_at TEXT
+    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_caches_status ON caches(status);
 
