@@ -194,16 +194,6 @@ impl Client {
         self.adaptive.lock().unwrap().cut(retry_after);
     }
 
-    /// Current effective requests/sec (moves with AIMD).
-    pub fn rate(&self) -> f64 {
-        let i = self.adaptive.lock().unwrap().current();
-        if i.is_zero() {
-            f64::INFINITY
-        } else {
-            1.0 / i.as_secs_f64()
-        }
-    }
-
     fn auth_header(&self) -> String {
         format!(
             "Bearer {}",
