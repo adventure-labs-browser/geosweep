@@ -159,24 +159,19 @@ async fn main() -> Result<()> {
         auth_helper: &str,
         browser_state: &str,
     ) -> Result<api::Client> {
-        let auth = match auth::select_source(auth_helper, jar, bearer) {
-            auth::Source::Browser => {
-                println!("using self-healing browser authentication");
-                std::sync::Arc::new(auth::Auth::browser(auth_helper, browser_state).await?)
-            }
-            auth::Source::Session => {
-                println!("using legacy browser session jar");
-                std::sync::Arc::new(auth::Auth::session(jar).await?)
-            }
-            auth::Source::Static => {
-                println!("using pre-minted bearer (non-renewable)");
-                std::sync::Arc::new(auth::Auth::static_token(bearer))
-            }
-            auth::Source::Form => {
-                println!("logging in");
-                std::sync::Arc::new(auth::Auth::login(username, password).await?)
-            }
-        };
+        // Never commit to one source up front. Keep every configured source
+        // and walk the full failover chain on every expiry/401.
+        let auth = std::sync::Arc::new(
+            auth::Auth::resilient(
+                auth_helper,
+                browser_state,
+                jar,
+                bearer,
+                username,
+                password,
+            )
+            .await?,
+        );
         api::Client::new(rate, auth)
     }
 

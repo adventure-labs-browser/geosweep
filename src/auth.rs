@@ -25,18 +25,6 @@ pub(crate) enum Source {
     Form,
 }
 
-pub(crate) fn select_source(helper: &str, jar: &str, bearer: &str) -> Source {
-    if !helper.is_empty() {
-        Source::Browser
-    } else if !jar.is_empty() {
-        Source::Session
-    } else if !bearer.is_empty() {
-        Source::Static
-    } else {
-        Source::Form
-    }
-}
-
 pub(crate) fn configured_sources(
     helper: &str,
     jar: &str,
@@ -78,8 +66,6 @@ struct ResilientSources {
 enum Mode {
     Resilient(ResilientSources),
     Form { username: String, password: String },
-    Session,
-    Static,
 }
 
 pub struct Auth {
@@ -176,19 +162,6 @@ impl Auth {
         ))
     }
 
-    /// Legacy copied-cookie mode.
-    pub async fn session(jar_path: &str) -> Result<Self> {
-        let http = base_client(Some(load_jar(jar_path)?))?;
-        let (token, expires_in) = mint(&http).await?;
-        Ok(Self::wrap(http, Mode::Session, token, expires_in))
-    }
-
-    /// Explicit non-renewable bearer mode.
-    pub fn static_token(token: &str) -> Self {
-        let http = base_client(None).expect("tls client builds");
-        Self::wrap(http, Mode::Static, token.to_string(), 3600)
-    }
-
     fn wrap(http: reqwest::Client, mode: Mode, token: String, expires_in: u64) -> Self {
         Self {
             http,
@@ -237,10 +210,6 @@ impl Auth {
             Mode::Form { username, password } => {
                 form_login(&self.http, username, password).await?;
                 mint(&self.http).await?
-            }
-            Mode::Session => mint(&self.http).await?,
-            Mode::Static => {
-                anyhow::bail!("static bearer expired and no renewable fallback was configured")
             }
         };
         st.token = token.clone();
