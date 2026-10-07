@@ -45,6 +45,19 @@ jobs:
           done
           exit 1
 
+      - name: Prove auth recovery paths
+        run: |
+          rm -f gc-storage.json
+          echo "auth preflight 1/2: fresh browser login"
+          env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db verify
+          echo "auth preflight 2/2: saved browser session"
+          env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db verify
+        env:
+          GC_AUTH_HELPER: .github/scripts/gc-login.py
+          GC_BROWSER_STATE: gc-storage.json
+          GC_USER: ${{ secrets.GC_USER }}
+          GC_PASS: ${{ secrets.GC_PASS }}
+
       - name: Refresh pass
         # Rust owns auth for the entire crawl. It asks the Playwright helper
         # for a bearer, renews before expiry, reuses browser state when valid,
