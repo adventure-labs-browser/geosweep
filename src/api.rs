@@ -5,15 +5,15 @@
 //!       &take=N&skip=M[&sort=distance&asc=true]
 //!     Bearer: OAuth token from the website session (see auth.rs).
 //!   - Box-based: boxes tile exactly, no circular gaps.
-//!   - take maxes at 1000 (asked 2000, got 1000); we use 500.
+//!   - take maxes at 1000 (asked 2000, got 1000); we use the full 1000.
 //!   - Window rule: skip+take past ~10000 answers HTTP 500. Cells are
 //!     fully paginable up to totalCount ~9500-10000; above that we split.
 //!   - Basic accounts: premium-only caches come back WITHOUT coordinates
 //!     (collected as coord-less teaser rows, ready to backfill). Premium
 //!     accounts get everything with coords.
 //!
-//! One client is shared by all workers; a global fixed-interval limiter
-//! caps the aggregate request rate.
+//! One client is shared by all workers; a global adaptive limiter
+//! caps aggregate rate, coalesces throttle bursts, and rapidly recovers.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -31,12 +31,12 @@ pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
 /// Page size. Verified accepted; the server caps at 1000.
-pub const TAKE: usize = 500;
+pub const TAKE: usize = 1000;
 /// Above this totalCount a cell subdivides instead of paginating.
 /// Conservative under the ~10000 window rule.
 pub const PAGINATION_LIMIT: i64 = 9500;
 /// Never request a page starting past this (window would end past 10000).
-pub const MAX_SKIP: usize = 9500;
+pub const MAX_SKIP: usize = 9000;
 
 const RETRIES: u32 = 6;
 const BACKOFF: f64 = 1.7;
@@ -92,29 +92,37 @@ pub fn cell_box(cell: &Cell) -> (f64, f64, f64, f64) {
     )
 }
 
-/// Adaptive rate limiter: additive-increase / multiplicative-decrease
-/// on top of a fixed-interval scheduler. Clean requests gradually
-/// tighten the interval (faster); any 429/5xx/timeout doubles it and
-/// honors Retry-After. Converges to just under the server's patience
-/// instead of needing a hand-picked rate.
+/// Adaptive rate limiter with fast recovery and burst-coalesced backoff.
+///
+/// A single 429 burst can hit many concurrent workers. Treating every response
+/// as an independent signal used to multiply the interval all the way to 30s.
+/// We now cut at most once per short burst, honor Retry-After, and recover
+/// exponentially after a handful of clean requests.
 struct Adaptive {
     interval: Duration,
-    since_cut: u64,
+    base_interval: Duration,
+    clean: u64,
+    last_cut: Option<Instant>,
 }
 
-const MIN_INTERVAL: Duration = Duration::from_millis(10); // 100/s hard ceiling
+const MIN_INTERVAL: Duration = Duration::from_millis(50); // 20/s hard ceiling
 const MAX_INTERVAL: Duration = Duration::from_secs(30);
-const SUCCESSES_PER_STEP: u64 = 50;
+const RECOVERY_SUCCESSES: u64 = 5;
+const GROWTH_SUCCESSES: u64 = 50;
+const CUT_COOLDOWN: Duration = Duration::from_secs(5);
 
 impl Adaptive {
     fn new(rate: f64) -> Self {
+        let interval = if rate > 0.0 {
+            Duration::from_secs_f64(1.0 / rate)
+        } else {
+            Duration::ZERO
+        };
         Self {
-            interval: if rate > 0.0 {
-                Duration::from_secs_f64(1.0 / rate)
-            } else {
-                Duration::ZERO
-            },
-            since_cut: 0,
+            interval,
+            base_interval: interval,
+            clean: 0,
+            last_cut: None,
         }
     }
 
@@ -122,34 +130,53 @@ impl Adaptive {
         self.interval
     }
 
-    /// Call after a clean request: every SUCCESSES_PER_STEP successes
-    /// shaves a millisecond (additive increase toward the ceiling).
-    fn success(&mut self) {
+    /// Recover very quickly from throttle backoff, then cautiously probe
+    /// above the configured starting rate.
+    fn success(&mut self) -> Option<(Duration, Duration)> {
         if self.interval.is_zero() {
-            return;
+            return None;
         }
-        self.since_cut += 1;
-        if self.since_cut >= SUCCESSES_PER_STEP && self.interval > MIN_INTERVAL {
-            self.interval = (self.interval - Duration::from_millis(1)).max(MIN_INTERVAL);
-            self.since_cut = 0;
+        self.clean += 1;
+        let old = self.interval;
+        if self.interval > self.base_interval && self.clean >= RECOVERY_SUCCESSES {
+            self.interval = self
+                .interval
+                .mul_f64(0.5)
+                .max(self.base_interval)
+                .max(MIN_INTERVAL);
+            self.clean = 0;
+        } else if self.interval <= self.base_interval
+            && self.clean >= GROWTH_SUCCESSES
+            && self.interval > MIN_INTERVAL
+        {
+            self.interval = self.interval.mul_f64(0.9).max(MIN_INTERVAL);
+            self.clean = 0;
         }
+        (self.interval < old).then_some((old, self.interval))
     }
 
-    /// Call on 429/5xx/timeout: double the interval (floor Retry-After).
-    fn cut(&mut self, floor: Duration) {
+    /// Back off once per throttle burst instead of once per worker.
+    /// Retry-After is always honored even when the multiplicative cut is
+    /// coalesced with a recent one.
+    fn cut(&mut self, floor: Duration) -> (Duration, bool) {
+        let now = Instant::now();
+        let burst = self
+            .last_cut
+            .is_some_and(|last| now.saturating_duration_since(last) < CUT_COOLDOWN);
         let old = self.interval;
-        let doubled = old.mul_f64(2.0).max(floor);
-        self.interval = doubled.min(MAX_INTERVAL);
-        self.since_cut = 0;
-        if self.interval > old && self.interval >= Duration::from_secs(1) {
-            warn!(
-                "rate limiter backing off to {:.1}/s after throttling",
-                1.0 / self.interval.as_secs_f64()
-            );
+        let candidate = if burst {
+            old.max(floor)
+        } else {
+            old.mul_f64(2.0).max(floor)
+        };
+        self.interval = candidate.min(MAX_INTERVAL);
+        self.clean = 0;
+        if !burst {
+            self.last_cut = Some(now);
         }
+        (self.interval, self.interval > old)
     }
 }
-
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -189,14 +216,35 @@ impl Client {
         }
     }
 
-    /// Record a clean request (tightens the schedule).
+    /// Record a clean request and rapidly recover from prior throttling.
     fn note_success(&self) {
-        self.adaptive.lock().unwrap().success();
+        if let Some((old, new)) = self.adaptive.lock().unwrap().success() {
+            if old >= Duration::from_secs(1) || new >= Duration::from_secs(1) {
+                warn!(
+                    "rate limiter recovering: one request every {:.2}s -> {:.2}s",
+                    old.as_secs_f64(),
+                    new.as_secs_f64()
+                );
+            }
+        }
     }
 
-    /// Record throttling: double the interval (floor = Retry-After).
+    /// Record a 429. Concurrent responses from the same burst are coalesced,
+    /// and new acquisitions are held behind the resulting quiet period.
     fn note_limited(&self, retry_after: Duration) {
-        self.adaptive.lock().unwrap().cut(retry_after);
+        let (interval, changed) = self.adaptive.lock().unwrap().cut(retry_after);
+        if changed {
+            warn!(
+                "rate limiter backing off to {:.2}/s (one request every {:.2}s)",
+                1.0 / interval.as_secs_f64(),
+                interval.as_secs_f64()
+            );
+        }
+        let until = Instant::now() + interval.max(retry_after);
+        let mut next = self.next_slot.lock().unwrap();
+        if *next < until {
+            *next = until;
+        }
     }
 
     async fn auth_token(&self) -> Result<String, ApiError> {
@@ -237,7 +285,9 @@ impl Client {
                 Ok(r) => r,
                 Err(e) => {
                     let message = format!("network: {e}");
-                    self.note_limited(Duration::ZERO);
+                    // A transport failure already gets per-request exponential
+                    // backoff. Do not globally poison throughput for unrelated
+                    // DNS/TLS/network hiccups.
                     attempt += 1;
                     if attempt >= RETRIES {
                         return Err(ApiError::Retries(message));
@@ -298,7 +348,9 @@ impl Client {
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or_else(|| BACKOFF.powi(attempt as i32));
-                self.note_limited(Duration::from_secs_f64(wait));
+                if status == 429 {
+                    self.note_limited(Duration::from_secs_f64(wait));
+                }
                 let message =
                     format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
                 attempt += 1;
@@ -368,3 +420,49 @@ impl Client {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throttle_burst_is_coalesced() {
+        let mut a = Adaptive::new(5.0);
+        let (first, changed) = a.cut(Duration::from_secs(1));
+        assert!(changed);
+        assert_eq!(first, Duration::from_secs(1));
+
+        let (second, changed) = a.cut(Duration::ZERO);
+        assert!(!changed);
+        assert_eq!(second, first);
+
+        // A server-provided floor still wins inside the burst window.
+        let (third, changed) = a.cut(Duration::from_secs(3));
+        assert!(changed);
+        assert_eq!(third, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn throttle_recovery_is_exponential() {
+        let mut a = Adaptive::new(5.0);
+        let (interval, _) = a.cut(Duration::from_secs(30));
+        assert_eq!(interval, Duration::from_secs(30));
+
+        for _ in 0..RECOVERY_SUCCESSES {
+            a.success();
+        }
+        assert_eq!(a.current(), Duration::from_secs(15));
+
+        for _ in 0..RECOVERY_SUCCESSES {
+            a.success();
+        }
+        assert_eq!(a.current(), Duration::from_millis(7500));
+
+        // A few more clean batches get back near the configured rate,
+        // rather than requiring millions of successes.
+        for _ in 0..(RECOVERY_SUCCESSES * 7) {
+            a.success();
+        }
+        assert_eq!(a.current(), Duration::from_millis(200));
+    }
+}
