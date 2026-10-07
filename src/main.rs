@@ -92,7 +92,7 @@ enum Cmd {
         browser_state: String,
         /// Max aggregate requests/sec (adaptive limiter starts here
         /// and finds the ceiling on its own).
-        #[arg(long, default_value_t = 5.0)]
+        #[arg(long, default_value_t = 10.0)]
         crawl_rate: f64,
     },
     /// Print queue/cache counts.
