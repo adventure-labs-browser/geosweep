@@ -1,18 +1,10 @@
-//! geocaching.com auth with transparent renewal.
+//! geocaching.com authentication with transparent, multi-source recovery.
 //!
-//! Authentication modes:
-//!   1. Browser helper: reuses a saved Playwright session, falls back to a
-//!      fresh browser login, and can repeat that cycle forever.
-//!   2. Session cookies: legacy in-process cookie-jar renewal.
-//!   3. Static bearer: explicit non-renewable fallback only.
-//!   4. Form login: residential egress only; datacenter IPs are bot-walled.
-//!
-//! The GitHub workflow uses browser-helper mode so bearer expiry, cookie
-//! expiry, and a stale saved browser session all recover without losing crawl
-//! progress.
-//!
-//! Tokens and cookies live in memory (+ the ephemeral storage_state file
-//! in the workspace, never uploaded). Nothing is written to the db.
+//! The durable path is a browser helper backed by Playwright. Authentication
+//! is not a one-time choice: on every renewal we try every configured source
+//! in order until one works, then retry the whole chain with bounded backoff.
+//! A stale browser session is rebuilt by the helper; a static bearer is only
+//! a one-shot fallback and can never shadow a renewable source.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,21 +15,7 @@ use tracing::{info, warn};
 const SIGNIN_URL: &str =
     "https://www.geocaching.com/account/signin?returnUrl=%2Fplay";
 const TOKEN_URL: &str = "https://www.geocaching.com/account/oauth/token";
-/// Refresh ahead of the stated expiry by this much.
 const EXPIRY_SKEW_SECS: u64 = 600;
-
-struct AuthState {
-    mode: Mode,
-    token: String,
-    expires_at: Instant,
-}
-
-enum Mode {
-    Browser { helper: String, state_path: String },
-    Form { username: String, password: String },
-    Session,
-    Static,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
@@ -47,8 +25,6 @@ pub(crate) enum Source {
     Form,
 }
 
-/// Pick the strongest available auth source. Browser-helper mode is fully
-/// self-healing and therefore wins over all pre-minted or copied auth state.
 pub(crate) fn select_source(helper: &str, jar: &str, bearer: &str) -> Source {
     if !helper.is_empty() {
         Source::Browser
@@ -61,29 +37,130 @@ pub(crate) fn select_source(helper: &str, jar: &str, bearer: &str) -> Source {
     }
 }
 
+pub(crate) fn configured_sources(
+    helper: &str,
+    jar: &str,
+    bearer: &str,
+    username: &str,
+    password: &str,
+) -> Vec<Source> {
+    let mut out = Vec::new();
+    if !helper.is_empty() {
+        out.push(Source::Browser);
+    }
+    if !jar.is_empty() {
+        out.push(Source::Session);
+    }
+    if !bearer.is_empty() {
+        out.push(Source::Static);
+    }
+    if !username.is_empty() && !password.is_empty() {
+        out.push(Source::Form);
+    }
+    out
+}
+
+struct AuthState {
+    mode: Mode,
+    token: String,
+    expires_at: Instant,
+}
+
+struct ResilientSources {
+    helper: Option<(String, String)>,
+    session_http: Option<reqwest::Client>,
+    static_token: Option<String>,
+    form_http: Option<reqwest::Client>,
+    username: String,
+    password: String,
+}
+
+enum Mode {
+    Resilient(ResilientSources),
+    Form { username: String, password: String },
+    Session,
+    Static,
+}
+
 pub struct Auth {
     http: reqwest::Client,
     inner: tokio::sync::Mutex<AuthState>,
 }
 
 impl Auth {
-    /// Durable runner mode. The helper owns browser state and can rebuild it
-    /// from GC_USER/GC_PASS whenever the saved session no longer works.
+    /// Durable browser mode used by the workflow. Keep every additional
+    /// source present in the environment as a fallback instead of committing
+    /// to the browser forever.
     pub async fn browser(helper: &str, state_path: &str) -> Result<Self> {
-        let http = base_client(None)?;
-        let (token, expires_in) = browser_mint(helper, state_path).await?;
+        let jar = std::env::var("GC_JAR").unwrap_or_default();
+        let bearer = std::env::var("GC_BEARER").unwrap_or_default();
+        let username = std::env::var("GC_USER").unwrap_or_default();
+        let password = std::env::var("GC_PASS").unwrap_or_default();
+        Self::resilient(helper, state_path, &jar, &bearer, &username, &password).await
+    }
+
+    /// Multi-source auth. This is the mode used by crawl/refresh/verify.
+    ///
+    /// Renewal order is browser helper -> copied session jar -> static bearer
+    /// -> direct form login. Failure of one source never selects it forever:
+    /// every later renewal starts from the strongest source again.
+    pub async fn resilient(
+        helper: &str,
+        state_path: &str,
+        jar_path: &str,
+        bearer: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<Self> {
+        let configured = configured_sources(helper, jar_path, bearer, username, password);
+        if configured.is_empty() {
+            anyhow::bail!("no authentication sources configured");
+        }
+        info!("auth sources configured: {configured:?}");
+
+        let session_http = if jar_path.is_empty() {
+            None
+        } else {
+            match load_jar(jar_path).and_then(|jar| base_client(Some(jar))) {
+                Ok(http) => Some(http),
+                Err(e) => {
+                    warn!("legacy session jar could not be loaded ({e}); continuing with fallbacks");
+                    None
+                }
+            }
+        };
+
+        let form_http = if username.is_empty() || password.is_empty() {
+            None
+        } else {
+            match base_client(None) {
+                Ok(http) => Some(http),
+                Err(e) => {
+                    warn!("direct form-login client could not be built ({e}); continuing with fallbacks");
+                    None
+                }
+            }
+        };
+
+        let mut sources = ResilientSources {
+            helper: (!helper.is_empty()).then(|| (helper.to_string(), state_path.to_string())),
+            session_http,
+            static_token: (!bearer.is_empty()).then(|| bearer.to_string()),
+            form_http,
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+
+        let (token, expires_in) = renew_resilient(&mut sources).await?;
         Ok(Self::wrap(
-            http,
-            Mode::Browser {
-                helper: helper.to_string(),
-                state_path: state_path.to_string(),
-            },
+            base_client(None)?,
+            Mode::Resilient(sources),
             token,
             expires_in,
         ))
     }
 
-    /// Full form login (residential only).
+    /// Full direct form login. Kept for the explicit `auth` command.
     pub async fn login(username: &str, password: &str) -> Result<Self> {
         let http = base_client(None)?;
         form_login(&http, username, password).await?;
@@ -99,16 +176,14 @@ impl Auth {
         ))
     }
 
-    /// Session-cookie mode: loads a browser storage_state file, mints the
-    /// first bearer from it, renews the same way forever after.
+    /// Legacy copied-cookie mode.
     pub async fn session(jar_path: &str) -> Result<Self> {
         let http = base_client(Some(load_jar(jar_path)?))?;
         let (token, expires_in) = mint(&http).await?;
         Ok(Self::wrap(http, Mode::Session, token, expires_in))
     }
 
-    /// Wrap an externally minted bearer. Expiry unknown (~1h); renewal
-    /// is impossible and fails loudly instead of re-logging-in wrong.
+    /// Explicit non-renewable bearer mode.
     pub fn static_token(token: &str) -> Self {
         let http = base_client(None).expect("tls client builds");
         Self::wrap(http, Mode::Static, token.to_string(), 3600)
@@ -120,14 +195,15 @@ impl Auth {
             inner: tokio::sync::Mutex::new(AuthState {
                 mode,
                 token,
-                expires_at: Instant::now()
-                    + Duration::from_secs(expires_in.saturating_sub(EXPIRY_SKEW_SECS)),
+                expires_at: expiry_from(expires_in),
             }),
         }
     }
 
-    /// Valid token, renewing first if stale. The mutex is held through
-    /// renewal so sixteen workers cannot stampede the token endpoint.
+    /// Return a usable token, proactively renewing before expiry.
+    ///
+    /// The mutex stays held through renewal so all workers share one renewal
+    /// instead of stampeding the login/token endpoints.
     pub async fn token(&self) -> Result<String> {
         let mut st = self.inner.lock().await;
         if Instant::now() < st.expires_at {
@@ -136,8 +212,8 @@ impl Auth {
         self.refresh_locked(&mut st).await
     }
 
-    /// Refresh after a 401, but only if the rejected token is still current.
-    /// If another worker already renewed it, reuse that worker's token.
+    /// A request rejected this exact token. If another worker already replaced
+    /// it, reuse that newer token; otherwise run the full recovery chain.
     pub async fn refresh_rejected(&self, rejected_token: &str) -> Result<String> {
         let mut st = self.inner.lock().await;
         if st.token != rejected_token {
@@ -146,110 +222,135 @@ impl Auth {
         self.refresh_locked(&mut st).await
     }
 
+    /// Force the exact same renewal path used for expiry/401 recovery.
+    /// Used by the workflow preflight so renewal is proven immediately,
+    /// rather than waiting an hour to discover a broken recovery path.
+    pub async fn force_refresh(&self) -> Result<()> {
+        let mut st = self.inner.lock().await;
+        self.refresh_locked(&mut st).await?;
+        Ok(())
+    }
+
     async fn refresh_locked(&self, st: &mut AuthState) -> Result<String> {
-        let (token, expires_in) = match &st.mode {
-            Mode::Browser { helper, state_path } => {
-                browser_mint(helper, state_path).await?
-            }
+        let (token, expires_in) = match &mut st.mode {
+            Mode::Resilient(sources) => renew_resilient(sources).await?,
             Mode::Form { username, password } => {
                 form_login(&self.http, username, password).await?;
                 mint(&self.http).await?
             }
             Mode::Session => mint(&self.http).await?,
             Mode::Static => {
-                anyhow::bail!(
-                    "static bearer expired mid-run; configure GC_AUTH_HELPER for self-healing auth"
-                )
+                anyhow::bail!("static bearer expired and no renewable fallback was configured")
             }
         };
         st.token = token.clone();
-        st.expires_at =
-            Instant::now() + Duration::from_secs(expires_in.saturating_sub(EXPIRY_SKEW_SECS));
+        st.expires_at = expiry_from(expires_in);
         Ok(token)
     }
 }
 
-async fn browser_mint(helper: &str, state_path: &str) -> Result<(String, u64)> {
+fn expiry_from(expires_in: u64) -> Instant {
+    Instant::now()
+        + Duration::from_secs(expires_in.saturating_sub(EXPIRY_SKEW_SECS).max(30))
+}
+
+async fn renew_resilient(sources: &mut ResilientSources) -> Result<(String, u64)> {
+    let mut cycle: u32 = 0;
+
+    loop {
+        cycle += 1;
+
+        if let Some((helper, state_path)) = &sources.helper {
+            match browser_mint_once(helper, state_path).await {
+                Ok((token, expires_in, source)) => {
+                    info!("auth recovered via browser/{source}; token lifetime {expires_in}s");
+                    return Ok((token, expires_in));
+                }
+                Err(e) => warn!("browser auth failed: {e}; trying fallback sources"),
+            }
+        }
+
+        if let Some(http) = &sources.session_http {
+            match mint(http).await {
+                Ok((token, expires_in)) => {
+                    info!("auth recovered via copied browser session");
+                    return Ok((token, expires_in));
+                }
+                Err(e) => warn!("copied session auth failed: {e}; trying fallback sources"),
+            }
+        }
+
+        // A supplied bearer is useful only once. If it later gets rejected or
+        // expires, reusing the same bytes cannot possibly recover anything.
+        if let Some(token) = sources.static_token.take() {
+            info!("auth temporarily using one-shot static bearer fallback");
+            return Ok((token, 3600));
+        }
+
+        if let Some(http) = &sources.form_http {
+            match form_login(http, &sources.username, &sources.password).await {
+                Ok(()) => match mint(http).await {
+                    Ok((token, expires_in)) => {
+                        info!("auth recovered via direct form login");
+                        return Ok((token, expires_in));
+                    }
+                    Err(e) => warn!("direct form login succeeded but token mint failed: {e}"),
+                },
+                Err(e) => warn!("direct form login failed: {e}"),
+            }
+        }
+
+        let wait = (1u64 << cycle.min(5)).min(60);
+        warn!("all auth sources failed in cycle {cycle}; retrying entire chain in {wait}s");
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+async fn browser_mint_once(
+    helper: &str,
+    state_path: &str,
+) -> Result<(String, u64, String)> {
     if !std::path::Path::new(helper).is_file() {
         anyhow::bail!("browser auth helper does not exist: {helper}");
     }
 
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        let mut command = tokio::process::Command::new("python3");
-        command
-            .arg(helper)
-            .arg("--state")
-            .arg(state_path)
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(150), command.output()).await;
+    let mut command = tokio::process::Command::new("python3");
+    command
+        .arg(helper)
+        .arg("--state")
+        .arg(state_path)
+        .kill_on_drop(true);
 
-        match output {
-            Ok(Ok(out)) if out.status.success() => {
-                match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    Ok(v) => {
-                        let token = v
-                            .get("access_token")
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string);
-                        let expires_in = v
-                            .get("expires_in")
-                            .and_then(|e| e.as_u64())
-                            .unwrap_or(3600);
-                        let source = v
-                            .get("source")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("browser");
-                        if let Some(token) = token.filter(|t| t.matches('.').count() == 2) {
-                            info!(
-                                "browser auth ready via {source}; token lifetime {expires_in}s"
-                            );
-                            return Ok((token, expires_in));
-                        }
-                        warn!(
-                            "browser auth attempt {attempt} returned an invalid token payload; retrying"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "browser auth attempt {attempt} returned invalid JSON ({e}); retrying"
-                        );
-                    }
-                }
-            }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let detail: String = stderr.chars().take(500).collect();
-                if out.status.code() == Some(2) {
-                    anyhow::bail!(
-                        "browser auth configuration error: {}",
-                        detail.trim()
-                    );
-                }
-                warn!(
-                    "browser auth attempt {attempt} failed (status {}): {}; retrying",
-                    out.status,
-                    detail.trim()
-                );
-            }
-            Ok(Err(e)) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    anyhow::bail!("python3 is required for browser authentication");
-                }
-                warn!("browser auth attempt {attempt} could not start ({e}); retrying");
-            }
-            Err(_) => {
-                warn!(
-                    "browser auth attempt {attempt} exceeded 150s; killing it and retrying"
-                );
-            }
-        }
+    let out = match tokio::time::timeout(Duration::from_secs(240), command.output()).await {
+        Ok(result) => result.context("start browser auth helper")?,
+        Err(_) => anyhow::bail!("browser auth helper exceeded 240s and was killed"),
+    };
 
-        let shift = attempt.min(5);
-        let wait = (1u64 << shift).min(60);
-        tokio::time::sleep(Duration::from_secs(wait)).await;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail: String = stderr.chars().take(500).collect();
+        anyhow::bail!("helper status {}: {}", out.status, detail.trim());
     }
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("browser auth helper JSON")?;
+    let token = v
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .filter(|t| t.matches('.').count() == 2)
+        .context("browser auth helper returned invalid access_token")?
+        .to_string();
+    let expires_in = v
+        .get("expires_in")
+        .and_then(|e| e.as_u64())
+        .unwrap_or(3600);
+    let source = v
+        .get("source")
+        .and_then(|s| s.as_str())
+        .unwrap_or("browser")
+        .to_string();
+
+    Ok((token, expires_in, source))
 }
 
 fn base_client(jar: Option<reqwest::cookie::Jar>) -> Result<reqwest::Client> {
@@ -263,7 +364,6 @@ fn base_client(jar: Option<reqwest::cookie::Jar>) -> Result<reqwest::Client> {
     Ok(b.build()?)
 }
 
-/// Load a Playwright storage_state file into a cookie jar.
 fn load_jar(path: &str) -> Result<reqwest::cookie::Jar> {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).context("read cookie jar")?)?;
@@ -272,6 +372,7 @@ fn load_jar(path: &str) -> Result<reqwest::cookie::Jar> {
         .get("cookies")
         .and_then(|c| c.as_array())
         .context("storage_state has no cookies")?;
+
     for ck in cookies {
         let (Some(name), Some(value)) = (
             ck.get("name").and_then(|s| s.as_str()),
@@ -288,10 +389,10 @@ fn load_jar(path: &str) -> Result<reqwest::cookie::Jar> {
             .context("cookie url")?;
         jar.add_cookie_str(&format!("{name}={value}"), &url);
     }
+
     Ok(jar)
 }
 
-/// Website form login into the client's cookie store/session.
 async fn form_login(
     http: &reqwest::Client,
     username: &str,
@@ -306,6 +407,7 @@ async fn form_login(
             page.chars().take(200).collect::<String>()
         );
     }
+
     let token = extract_token(&page)?;
     let login_resp = http
         .post(SIGNIN_URL)
@@ -322,10 +424,10 @@ async fn form_login(
     if !login_status.is_success() {
         anyhow::bail!("login post http {login_status}");
     }
+
     Ok(())
 }
 
-/// Mint an api-proxy bearer from the client's session cookies.
 async fn mint(http: &reqwest::Client) -> Result<(String, u64)> {
     let tok_resp = http.get(TOKEN_URL).send().await.context("oauth token fetch")?;
     let tok_status = tok_resp.status();
@@ -336,6 +438,7 @@ async fn mint(http: &reqwest::Client) -> Result<(String, u64)> {
             tok_body.chars().take(200).collect::<String>()
         );
     }
+
     let tok: serde_json::Value =
         serde_json::from_str(&tok_body).context("oauth token json")?;
     let access = tok
@@ -347,10 +450,10 @@ async fn mint(http: &reqwest::Client) -> Result<(String, u64)> {
         .get("expires_in")
         .and_then(|e| e.as_u64())
         .unwrap_or(3600);
+
     Ok((access, expires_in))
 }
 
-/// Extract __RequestVerificationToken from the signin page HTML.
 fn extract_token(page: &str) -> Result<String> {
     let key = r#"name="__RequestVerificationToken""#;
     let i = page
@@ -369,27 +472,21 @@ fn extract_token(page: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_source, Source};
+    use super::{configured_sources, Source};
 
     #[test]
-    fn browser_helper_beats_every_legacy_source() {
+    fn all_sources_are_kept_in_failover_order() {
         assert_eq!(
-            select_source("gc-login.py", "gc-storage.json", "stale-token"),
-            Source::Browser
+            configured_sources("helper.py", "jar.json", "token", "user", "pass"),
+            vec![Source::Browser, Source::Session, Source::Static, Source::Form]
         );
     }
 
     #[test]
-    fn session_jar_beats_static_bearer_without_helper() {
+    fn missing_sources_are_skipped_not_selected_forever() {
         assert_eq!(
-            select_source("", "gc-storage.json", "stale-token"),
-            Source::Session
+            configured_sources("helper.py", "", "", "user", "pass"),
+            vec![Source::Browser, Source::Form]
         );
-    }
-
-    #[test]
-    fn static_bearer_is_only_used_without_renewable_auth() {
-        assert_eq!(select_source("", "", "token"), Source::Static);
-        assert_eq!(select_source("", "", ""), Source::Form);
     }
 }

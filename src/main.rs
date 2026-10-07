@@ -118,7 +118,16 @@ enum Cmd {
         #[arg(long, env = "GC_BROWSER_STATE", default_value = "gc-storage.json")]
         browser_state: String,
     },
-    /// Test website credentials (logs in, prints result).
+    /// Prove browser auth can log in and then renew in-process.
+    AuthBrowser {
+        /// Browser auth helper (env: GC_AUTH_HELPER).
+        #[arg(long, env = "GC_AUTH_HELPER", default_value = ".github/scripts/gc-login.py")]
+        auth_helper: String,
+        /// Playwright storage-state path used by the browser auth helper.
+        #[arg(long, env = "GC_BROWSER_STATE", default_value = "gc-storage.json")]
+        browser_state: String,
+    },
+    /// Test direct website credentials (logs in, prints result).
     Auth {
         /// Geocaching username (env: GC_USER).
         #[arg(long, env = "GC_USER")]
@@ -259,6 +268,15 @@ async fn main() -> Result<()> {
             )
             .await?;
             crawl::verify_global(&db, &client).await;
+            Ok(())
+        }
+        Cmd::AuthBrowser {
+            auth_helper,
+            browser_state,
+        } => {
+            let auth = auth::Auth::browser(&auth_helper, &browser_state).await?;
+            auth.force_refresh().await?;
+            println!("browser auth preflight ok (initial auth + forced renewal)");
             Ok(())
         }
         Cmd::Auth { username, password } => {
