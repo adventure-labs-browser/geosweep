@@ -70,8 +70,17 @@ def parse_token_response(resp):
     return access, int(remaining)
 
 
-def mint(page):
-    return parse_token_response(page.goto(TOKEN, wait_until="domcontentloaded", timeout=60000))
+def mint(context):
+    # Use a disposable page so probing the token endpoint never navigates the
+    # login page away from its form. This is intentionally a real browser
+    # navigation rather than a bare HTTP request because datacenter traffic is
+    # treated differently by the site.
+    token_page = context.new_page()
+    try:
+        resp = token_page.goto(TOKEN, wait_until="domcontentloaded", timeout=60000)
+        return parse_token_response(resp)
+    finally:
+        token_page.close()
 
 
 def dismiss_consent(page):
@@ -86,16 +95,9 @@ def dismiss_consent(page):
             pass
 
 
-def fresh_login(page, user, password):
+def fresh_login(context, page, user, password):
     page.goto(SIGNIN, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(1500)
-
-    # A still-valid website session can redirect away from the form.
-    try:
-        return mint(page)
-    except Exception:
-        pass
-
     dismiss_consent(page)
     user_field = page.locator('input[name="UsernameOrEmail"]').first
     pass_field = page.locator('input[name="Password"]').first
@@ -129,7 +131,7 @@ def fresh_login(page, user, password):
             # variants do not land on /play even though authentication worked.
             pass
 
-    return mint(page)
+    return mint(context)
 
 
 def save_state(context, state_path):
@@ -160,7 +162,7 @@ def run_once(state_path, user, password, screenshot):
         try:
             if had_state:
                 try:
-                    access, expires_in = mint(page)
+                    access, expires_in = mint(context)
                     save_state(context, state_path)
                     return access, expires_in, "saved-session"
                 except Exception as e:
@@ -170,7 +172,7 @@ def run_once(state_path, user, password, screenshot):
                     context = browser.new_context(user_agent=USER_AGENT)
                     page = context.new_page()
 
-            access, expires_in = fresh_login(page, user, password)
+            access, expires_in = fresh_login(context, page, user, password)
             save_state(context, state_path)
             return access, expires_in, "fresh-login"
         except Exception:
