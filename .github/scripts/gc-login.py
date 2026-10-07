@@ -20,6 +20,8 @@ user = os.environ["GC_USER"]
 pw = os.environ["GC_PASS"]
 
 CONSENT = [
+    # Cookiebot (Usercentrics) — prefer necessary-only.
+    'button:has-text("Necessary cookies only")',
     "#onetrust-accept-btn-handler",
     'button:has-text("Accept all")',
     'button:has-text("Accept")',
@@ -67,8 +69,9 @@ with sync_playwright() as p:
                 pass
         page.locator('input[name="UsernameOrEmail"]').fill(user, timeout=15000)
         page.locator('input[name="Password"]').fill(pw, timeout=15000)
-        page.locator('input[type="submit"], button[type="submit"]').first.click(
-            timeout=15000)
+        # Submit via Enter: the page has multiple submit buttons (some
+        # hidden) and a cookie overlay — all of which break button clicks.
+        page.locator('input[name="Password"]').press("Enter")
         try:
             page.wait_for_url("**/play**", timeout=45000)
         except Exception:
