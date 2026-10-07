@@ -55,10 +55,11 @@ jobs:
           retention-days: 7
 
       - name: Refresh pass
+        # NOTE: GC_BEARER is deliberately NOT passed: a static bearer
+        # dies mid-run and shadows the self-renewing session jar.
         run: ./target/release/geosweep --db data/geosweep.db refresh
         env:
           GC_JAR: gc-storage.json
-          GC_BEARER: ${{ env.GC_BEARER }}
 
       - name: Validate database before publish
         if: always()
