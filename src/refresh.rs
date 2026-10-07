@@ -21,44 +21,22 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let labs_before = db.labs_count().await?;
     let n = db.requeue_done().await?;
     info!("refresh: {n} crawl cells re-queued");
-    // Browser-helper mode is the durable path: it reuses a saved browser
-    // session and performs a fresh browser login whenever that session stops
-    // working. Legacy jar/bearer/form modes remain for manual use.
-    let client = match crate::auth::select_source(
-        &args.auth_helper,
-        &args.jar,
-        &args.bearer,
-    ) {
-        crate::auth::Source::Browser => {
-            info!("refresh: using self-healing browser authentication");
-            Client::new(
-                args.crawl_rate,
-                std::sync::Arc::new(
-                    crate::auth::Auth::browser(&args.auth_helper, &args.browser_state).await?,
-                ),
-            )?
-        }
-        crate::auth::Source::Session => {
-            info!("refresh: using legacy browser session jar");
-            Client::new(
-                args.crawl_rate,
-                std::sync::Arc::new(crate::auth::Auth::session(&args.jar).await?),
-            )?
-        }
-        crate::auth::Source::Static => {
-            info!("refresh: using pre-minted bearer (non-renewable)");
-            Client::new(
-                args.crawl_rate,
-                std::sync::Arc::new(crate::auth::Auth::static_token(&args.bearer)),
-            )?
-        }
-        crate::auth::Source::Form => {
-            let auth =
-                std::sync::Arc::new(crate::auth::Auth::login(&args.username, &args.password).await?);
-            info!("refresh: logged in, starting crawl");
-            Client::new(args.crawl_rate, auth)?
-        }
-    };
+    // Keep every configured credential source available. Renewal always
+    // retries the complete chain instead of committing to whichever source
+    // happened to work first.
+    info!("refresh: using resilient authentication chain");
+    let auth = std::sync::Arc::new(
+        crate::auth::Auth::resilient(
+            &args.auth_helper,
+            &args.browser_state,
+            &args.jar,
+            &args.bearer,
+            &args.username,
+            &args.password,
+        )
+        .await?,
+    );
+    let client = Client::new(args.crawl_rate, auth)?;
     crawl::run(
         db.clone(),
         client,
