@@ -51,10 +51,9 @@ jobs:
       - name: Prove auth recovery paths
         run: |
           rm -f gc-storage.json
-          echo "auth preflight 1/2: fresh browser login"
-          env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db verify
-          echo "auth preflight 2/2: saved browser session"
-          env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db verify
+          # This uses one Auth instance: first call must establish auth, then
+          # force_refresh exercises the exact expiry/401 renewal path immediately.
+          env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db auth-browser
         env:
           GC_AUTH_HELPER: .github/scripts/gc-login.py
           GC_BROWSER_STATE: gc-storage.json
