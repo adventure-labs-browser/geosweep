@@ -34,11 +34,22 @@ jobs:
       - name: Migrate database
         run: ./target/release/geosweep --db data/geosweep.db stats
 
-      - name: Refresh pass
-        run: ./target/release/geosweep --db data/geosweep.db refresh
+      - name: Browser login (form login is bot-walled from datacenters)
+        run: |
+          pip install -q playwright
+          python -m playwright install chromium --with-deps
+          python3 .github/scripts/gc-login.py > /tmp/bearer.env
+          head -n 1 /tmp/bearer.env
+          tail -n +2 /tmp/bearer.env >> "$GITHUB_ENV"
+          rm -f /tmp/bearer.env
         env:
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
+
+      - name: Refresh pass
+        run: ./target/release/geosweep --db data/geosweep.db refresh
+        env:
+          GC_BEARER: ${{ env.GC_BEARER }}
 
       - name: Validate database before publish
         if: always()
