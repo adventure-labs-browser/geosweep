@@ -130,16 +130,24 @@ async fn main() -> Result<()> {
         bearer: &str,
         jar: &str,
     ) -> Result<api::Client> {
-        // Bearer > session jar > form login.
-        let auth = if !bearer.is_empty() {
-            println!("using pre-minted bearer");
-            std::sync::Arc::new(auth::Auth::static_token(bearer))
-        } else if !jar.is_empty() {
-            println!("using browser session jar");
-            std::sync::Arc::new(auth::Auth::session(jar).await?)
-        } else {
-            println!("logging in");
-            std::sync::Arc::new(auth::Auth::login(username, password).await?)
+        // Renewable session auth always wins if both inputs exist.
+        let auth = match auth::select_source(jar, bearer) {
+            auth::Source::Session => {
+                if !bearer.is_empty() {
+                    println!("using browser session jar; ignoring inherited static bearer");
+                } else {
+                    println!("using browser session jar");
+                }
+                std::sync::Arc::new(auth::Auth::session(jar).await?)
+            }
+            auth::Source::Static => {
+                println!("using pre-minted bearer (non-renewable)");
+                std::sync::Arc::new(auth::Auth::static_token(bearer))
+            }
+            auth::Source::Form => {
+                println!("logging in");
+                std::sync::Arc::new(auth::Auth::login(username, password).await?)
+            }
         };
         api::Client::new(rate, auth)
     }

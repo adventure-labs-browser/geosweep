@@ -1,9 +1,11 @@
-"""Log into geocaching.com with real Chromium (datacenter form login
-is bot-walled; a full browser passes) and print an api-proxy bearer.
+"""Log into geocaching.com with real Chromium.
+
+Datacenter form login is bot-walled; a full browser passes. The durable
+output is gc-storage.json, whose session cookies let geosweep mint fresh
+api-proxy bearers during long runs. A bearer is minted here only to prove
+the saved session works; it is deliberately never exported.
 
 Usage: GC_USER=... GC_PASS=... python3 gc-login.py
-Stdout line 1: ::add-mask::<token> (caller echoes to step stdout)
-Stdout line 2: GC_BEARER=<token> (caller appends to $GITHUB_ENV)
 On failure: saves screenshot to gc-login-fail.png, prints page state.
 """
 import json
@@ -79,8 +81,8 @@ with sync_playwright() as p:
             fail(page, "no redirect to /play after submit")
         resp = page.goto(TOKEN, timeout=60000)
         body = resp.text() if resp else ""
-        # Persist the session (cookies) so the scraper can mint fresh
-        # bearers itself all run long — the bearer below is only the first.
+        # Persist the browser session. The scraper mints its own short-lived
+        # bearers from these cookies and renews them before expiry.
         context.storage_state(path="gc-storage.json")
     except SystemExit:
         raise
@@ -96,6 +98,6 @@ except Exception:
     print(f"LOGIN FAILED: token endpoint gave: {body[:200]}", file=sys.stderr)
     sys.exit(1)
 
-# Mask BEFORE the value ever hits stdout.
-print(f"::add-mask::{access}")
-print(f"GC_BEARER={access}")
+# Do not print or export the bearer. In particular, never put GC_BEARER in
+# GITHUB_ENV: its presence would make a long run select non-renewable auth.
+print("browser login ok; renewable session jar written")
