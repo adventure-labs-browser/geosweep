@@ -42,9 +42,15 @@ enum Cmd {
         /// use when datacenter egress is bot-walled.
         #[arg(long, env = "GC_BEARER", default_value = "")]
         bearer: String,
-        /// Browser session jar (env: GC_JAR). Self-renewing all run long.
+        /// Legacy browser session jar (env: GC_JAR).
         #[arg(long, env = "GC_JAR", default_value = "")]
         jar: String,
+        /// Browser auth helper (env: GC_AUTH_HELPER). Re-authenticates as needed.
+        #[arg(long, env = "GC_AUTH_HELPER", default_value = "")]
+        auth_helper: String,
+        /// Playwright storage-state path used by the browser auth helper.
+        #[arg(long, env = "GC_BROWSER_STATE", default_value = "gc-storage.json")]
+        browser_state: String,
         /// Number of fibonacci-sphere seed cells.
         #[arg(long, default_value_t = 16)]
         seeds: usize,
@@ -75,9 +81,15 @@ enum Cmd {
         /// Pre-minted bearer (env: GC_BEARER). Skips form login.
         #[arg(long, env = "GC_BEARER", default_value = "")]
         bearer: String,
-        /// Browser session jar (env: GC_JAR). Self-renewing all run long.
+        /// Legacy browser session jar (env: GC_JAR).
         #[arg(long, env = "GC_JAR", default_value = "")]
         jar: String,
+        /// Browser auth helper (env: GC_AUTH_HELPER). Re-authenticates as needed.
+        #[arg(long, env = "GC_AUTH_HELPER", default_value = "")]
+        auth_helper: String,
+        /// Playwright storage-state path used by the browser auth helper.
+        #[arg(long, env = "GC_BROWSER_STATE", default_value = "gc-storage.json")]
+        browser_state: String,
         /// Max aggregate requests/sec (adaptive limiter starts here
         /// and finds the ceiling on its own).
         #[arg(long, default_value_t = 5.0)]
@@ -96,9 +108,15 @@ enum Cmd {
         /// Pre-minted bearer (env: GC_BEARER).
         #[arg(long, env = "GC_BEARER", default_value = "")]
         bearer: String,
-        /// Browser session jar (env: GC_JAR).
+        /// Legacy browser session jar (env: GC_JAR).
         #[arg(long, env = "GC_JAR", default_value = "")]
         jar: String,
+        /// Browser auth helper (env: GC_AUTH_HELPER).
+        #[arg(long, env = "GC_AUTH_HELPER", default_value = "")]
+        auth_helper: String,
+        /// Playwright storage-state path used by the browser auth helper.
+        #[arg(long, env = "GC_BROWSER_STATE", default_value = "gc-storage.json")]
+        browser_state: String,
     },
     /// Test website credentials (logs in, prints result).
     Auth {
@@ -129,15 +147,16 @@ async fn main() -> Result<()> {
         password: &str,
         bearer: &str,
         jar: &str,
+        auth_helper: &str,
+        browser_state: &str,
     ) -> Result<api::Client> {
-        // Renewable session auth always wins if both inputs exist.
-        let auth = match auth::select_source(jar, bearer) {
+        let auth = match auth::select_source(auth_helper, jar, bearer) {
+            auth::Source::Browser => {
+                println!("using self-healing browser authentication");
+                std::sync::Arc::new(auth::Auth::browser(auth_helper, browser_state).await?)
+            }
             auth::Source::Session => {
-                if !bearer.is_empty() {
-                    println!("using browser session jar; ignoring inherited static bearer");
-                } else {
-                    println!("using browser session jar");
-                }
+                println!("using legacy browser session jar");
                 std::sync::Arc::new(auth::Auth::session(jar).await?)
             }
             auth::Source::Static => {
@@ -160,6 +179,8 @@ async fn main() -> Result<()> {
             password,
             bearer,
             jar,
+            auth_helper,
+            browser_state,
             seeds,
             seed_radius_m,
             min_radius_m,
@@ -167,7 +188,16 @@ async fn main() -> Result<()> {
             reset,
             reset_failed,
         } => {
-            let client = authed(rate, &username, &password, &bearer, &jar).await?;
+            let client = authed(
+                rate,
+                &username,
+                &password,
+                &bearer,
+                &jar,
+                &auth_helper,
+                &browser_state,
+            )
+            .await?;
             crawl::run(
                 db,
                 client,
@@ -188,6 +218,8 @@ async fn main() -> Result<()> {
             password,
             bearer,
             jar,
+            auth_helper,
+            browser_state,
             crawl_rate,
         } => {
             refresh::run(
@@ -197,6 +229,8 @@ async fn main() -> Result<()> {
                     password,
                     bearer,
                     jar,
+                    auth_helper,
+                    browser_state,
                     crawl_rate,
                 },
             )
@@ -211,8 +245,19 @@ async fn main() -> Result<()> {
             password,
             bearer,
             jar,
+            auth_helper,
+            browser_state,
         } => {
-            let client = authed(5.0, &username, &password, &bearer, &jar).await?;
+            let client = authed(
+                5.0,
+                &username,
+                &password,
+                &bearer,
+                &jar,
+                &auth_helper,
+                &browser_state,
+            )
+            .await?;
             crawl::verify_global(&db, &client).await;
             Ok(())
         }
