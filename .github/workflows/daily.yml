@@ -46,6 +46,14 @@ jobs:
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
 
+      - name: Upload login screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc-login-fail
+          path: gc-login-fail.png
+          retention-days: 7
+
       - name: Refresh pass
         run: ./target/release/geosweep --db data/geosweep.db refresh
         env:
