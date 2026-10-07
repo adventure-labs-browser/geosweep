@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tracing::warn;
+use tracing::{info, warn};
 
 const SIGNIN_URL: &str =
     "https://www.geocaching.com/account/signin?returnUrl=%2Fplay";
@@ -196,7 +196,14 @@ async fn browser_mint(helper: &str, state_path: &str) -> Result<(String, u64)> {
                             .get("expires_in")
                             .and_then(|e| e.as_u64())
                             .unwrap_or(3600);
+                        let source = v
+                            .get("source")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("browser");
                         if let Some(token) = token.filter(|t| t.matches('.').count() == 2) {
+                            info!(
+                                "browser auth ready via {source}; token lifetime {expires_in}s"
+                            );
                             return Ok((token, expires_in));
                         }
                         warn!(
