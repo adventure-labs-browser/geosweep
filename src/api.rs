@@ -220,7 +220,6 @@ impl Client {
             "{SEARCH_URL}?box={lat_max},{lon_min},{lat_min},{lon_max}\
              &rad=16000&take={take}&skip={skip}&sort=distance&asc=true&app=geosweep"
         );
-        let mut last_err = String::new();
         let mut attempt: u32 = 0;
         let mut auth_failures: u32 = 0;
 
@@ -237,11 +236,11 @@ impl Client {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = format!("network: {e}");
+                    let message = format!("network: {e}");
                     self.note_limited(Duration::ZERO);
                     attempt += 1;
                     if attempt >= RETRIES {
-                        break;
+                        return Err(ApiError::Retries(message));
                     }
                     tokio::time::sleep(Duration::from_secs_f64(BACKOFF.powi(attempt as i32)))
                         .await;
@@ -280,10 +279,10 @@ impl Client {
                         });
                     }
                     Err(e) => {
-                        last_err = format!("json: {e}");
+                        let message = format!("json: {e}");
                         attempt += 1;
                         if attempt >= RETRIES {
-                            break;
+                            return Err(ApiError::Retries(message));
                         }
                         tokio::time::sleep(Duration::from_secs_f64(BACKOFF.powi(attempt as i32)))
                             .await;
@@ -300,11 +299,11 @@ impl Client {
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or_else(|| BACKOFF.powi(attempt as i32));
                 self.note_limited(Duration::from_secs_f64(wait));
-                last_err =
+                let message =
                     format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
                 attempt += 1;
                 if attempt >= RETRIES {
-                    break;
+                    return Err(ApiError::Retries(message));
                 }
                 tokio::time::sleep(Duration::from_secs_f64(wait)).await;
                 continue;
@@ -316,7 +315,6 @@ impl Client {
             ));
         }
 
-        Err(ApiError::Retries(last_err))
     }
 
     /// Coverage check: totalCount for a planet-sized box. Authentication
