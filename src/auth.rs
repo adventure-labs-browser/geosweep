@@ -47,7 +47,7 @@ impl Auth {
         let (token, expires_in) = mint(&http).await?;
         Ok(Self::wrap(
             http,
-            Mode::Login {
+            Mode::Form {
                 username: username.to_string(),
                 password: password.to_string(),
             },
@@ -103,7 +103,7 @@ impl Auth {
         let mode: Option<(String, String)> = {
             let st = self.inner.lock().await;
             match &st.mode {
-                Mode::Login { username, password } => {
+                Mode::Form { username, password } => {
                     Some((username.clone(), password.clone()))
                 }
                 Mode::Session => None,
