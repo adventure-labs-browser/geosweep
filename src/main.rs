@@ -33,11 +33,15 @@ enum Cmd {
         #[arg(long, default_value_t = 10.0)]
         rate: f64,
         /// Geocaching username (env: GC_USER).
-        #[arg(long, env = "GC_USER")]
+        #[arg(long, env = "GC_USER", default_value = "")]
         username: String,
         /// Geocaching password (env: GC_PASS).
-        #[arg(long, env = "GC_PASS")]
+        #[arg(long, env = "GC_PASS", default_value = "")]
         password: String,
+        /// Pre-minted bearer (env: GC_BEARER). Skips form login;
+        /// use when datacenter egress is bot-walled.
+        #[arg(long, env = "GC_BEARER", default_value = "")]
+        bearer: String,
         /// Number of fibonacci-sphere seed cells.
         #[arg(long, default_value_t = 16)]
         seeds: usize,
@@ -60,11 +64,14 @@ enum Cmd {
     /// Refresh pass: re-queue cells, pick up new/changed caches.
     Refresh {
         /// Geocaching username (env: GC_USER).
-        #[arg(long, env = "GC_USER")]
+        #[arg(long, env = "GC_USER", default_value = "")]
         username: String,
         /// Geocaching password (env: GC_PASS).
-        #[arg(long, env = "GC_PASS")]
+        #[arg(long, env = "GC_PASS", default_value = "")]
         password: String,
+        /// Pre-minted bearer (env: GC_BEARER). Skips form login.
+        #[arg(long, env = "GC_BEARER", default_value = "")]
+        bearer: String,
         /// Max aggregate requests/sec (adaptive limiter starts here
         /// and finds the ceiling on its own).
         #[arg(long, default_value_t = 5.0)]
@@ -110,12 +117,20 @@ async fn main() -> Result<()> {
         api::Client::new(rate, auth)
     }
 
+    /// Client from a pre-minted bearer (browser login step). Use when
+    /// direct form login is bot-walled (datacenter egress).
+    async fn authed_bearer(rate: f64, bearer: &str) -> Result<api::Client> {
+        println!("using pre-minted bearer");
+        api::Client::new(rate, std::sync::Arc::new(auth::Auth::static_token(bearer)))
+    }
+
     match cli.cmd {
         Cmd::Crawl {
             concurrency,
             rate,
             username,
             password,
+            bearer,
             seeds,
             seed_radius_m,
             min_radius_m,
@@ -123,7 +138,11 @@ async fn main() -> Result<()> {
             reset,
             reset_failed,
         } => {
-            let client = authed(rate, &username, &password).await?;
+            let client = if !bearer.is_empty() {
+                authed_bearer(rate, &bearer).await?
+            } else {
+                authed(rate, &username, &password).await?
+            };
             crawl::run(
                 db,
                 client,
@@ -142,6 +161,7 @@ async fn main() -> Result<()> {
         Cmd::Refresh {
             username,
             password,
+            bearer,
             crawl_rate,
         } => {
             refresh::run(
@@ -149,6 +169,7 @@ async fn main() -> Result<()> {
                 refresh::Args {
                     username,
                     password,
+                    bearer,
                     crawl_rate,
                 },
             )

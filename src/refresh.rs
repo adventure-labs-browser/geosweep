@@ -10,6 +10,7 @@ use crate::{api::Client, crawl, db::Db};
 pub struct Args {
     pub username: String,
     pub password: String,
+    pub bearer: String,
     pub crawl_rate: f64,
 }
 
@@ -17,11 +18,21 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let labs_before = db.labs_count().await?;
     let n = db.requeue_done().await?;
     info!("refresh: {n} crawl cells re-queued");
-    let auth = std::sync::Arc::new(crate::auth::Auth::login(&args.username, &args.password).await?);
-    info!("refresh: logged in, starting crawl");
+    let client = if !args.bearer.is_empty() {
+        info!("refresh: using pre-minted bearer");
+        Client::new(
+            args.crawl_rate,
+            std::sync::Arc::new(crate::auth::Auth::static_token(&args.bearer)),
+        )?
+    } else {
+        let auth =
+            std::sync::Arc::new(crate::auth::Auth::login(&args.username, &args.password).await?);
+        info!("refresh: logged in, starting crawl");
+        Client::new(args.crawl_rate, auth)?
+    };
     crawl::run(
         db.clone(),
-        Client::new(args.crawl_rate, auth)?,
+        client,
         crawl::Args {
             concurrency: 16,
             seeds: 16,

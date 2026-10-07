@@ -33,10 +33,16 @@ fn extract_token(page: &str) -> Result<String> {
 }
 
 struct AuthState {
-    username: String,
-    password: String,
+    mode: Mode,
     token: String,
     expires_at: Instant,
+}
+
+enum Mode {
+    /// Website credentials: can re-login any time.
+    Login { username: String, password: String },
+    /// Pre-minted bearer (e.g. via browser login step): cannot renew.
+    Static,
 }
 
 pub struct Auth {
@@ -46,15 +52,32 @@ pub struct Auth {
 impl Auth {
     pub async fn login(username: &str, password: &str) -> Result<Self> {
         let (token, expires_in) = do_login(username, password).await?;
-        Ok(Self {
-            inner: tokio::sync::Mutex::new(AuthState {
+        Ok(Self::from_parts(
+            Mode::Login {
                 username: username.to_string(),
                 password: password.to_string(),
+            },
+            token,
+            expires_in,
+        ))
+    }
+
+    /// Wrap an externally minted bearer (browser login step). Expiry is
+    /// unknown; assume one hour from now. Renewal is impossible — a
+    /// stale static bearer fails loudly instead of re-logging-in wrong.
+    pub fn static_token(token: &str) -> Self {
+        Self::from_parts(Mode::Static, token.to_string(), 3600)
+    }
+
+    fn from_parts(mode: Mode, token: String, expires_in: u64) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(AuthState {
+                mode,
                 token,
                 expires_at: Instant::now()
                     + Duration::from_secs(expires_in.saturating_sub(EXPIRY_SKEW_SECS)),
             }),
-        })
+        }
     }
 
     /// Valid token, refreshing first if stale.
@@ -74,10 +97,20 @@ impl Auth {
     }
 
     async fn refresh(&self) -> Result<String> {
-        let (u, p) = {
+        let mode = {
             let st = self.inner.lock().await;
-            (st.username.clone(), st.password.clone())
+            match &st.mode {
+                Mode::Login { username, password } => {
+                    (username.clone(), password.clone())
+                }
+                Mode::Static => {
+                    anyhow::bail!(
+                        "static bearer expired mid-run; re-mint it in the login step"
+                    )
+                }
+            }
         };
+        let (u, p) = mode;
         let (token, expires_in) = do_login(&u, &p).await?;
         let mut st = self.inner.lock().await;
         st.token = token.clone();
