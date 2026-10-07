@@ -206,7 +206,9 @@ impl Client {
             .map_err(|e| ApiError::Auth(format!("token refresh: {e}")))
     }
 
-    /// One box page. Retries retriable statuses with backoff.
+    /// One box page. Network/server failures are bounded per cell, but
+    /// authentication failures are not converted into failed cells: recover
+    /// auth and retry the exact request until a credential source works.
     pub async fn search(
         &self,
         cell: &Cell,
@@ -219,8 +221,10 @@ impl Client {
              &rad=16000&take={take}&skip={skip}&sort=distance&asc=true&app=geosweep"
         );
         let mut last_err = String::new();
-        let mut refreshed = false;
-        for attempt in 0..RETRIES {
+        let mut attempt: u32 = 0;
+        let mut auth_failures: u32 = 0;
+
+        loop {
             self.acquire().await;
             let token = self.auth_token().await?;
             let resp = match self
@@ -235,21 +239,33 @@ impl Client {
                 Err(e) => {
                     last_err = format!("network: {e}");
                     self.note_limited(Duration::ZERO);
-                    tokio::time::sleep(Duration::from_secs_f64(BACKOFF.powi(attempt as i32))).await;
+                    attempt += 1;
+                    if attempt >= RETRIES {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs_f64(BACKOFF.powi(attempt as i32)))
+                        .await;
                     continue;
                 }
             };
+
             let status = resp.status().as_u16();
-            if status == 401 && !refreshed {
-                // Token died mid-run: one transparent re-login, then retry.
-                refreshed = true;
-                match self.auth.refresh_rejected(&token).await {
-                    Ok(_) => continue,
-                    Err(e) => {
-                        return Err(ApiError::Auth(format!("token renewal after 401: {e}")))
-                    }
-                }
+            if status == 401 || status == 403 {
+                let detail = snippet(&resp.text().await.unwrap_or_default(), 160);
+                auth_failures += 1;
+                warn!(
+                    "auth rejected with http {status} (attempt {auth_failures}): {detail}; rebuilding auth"
+                );
+                self.auth
+                    .refresh_rejected(&token)
+                    .await
+                    .map_err(|e| ApiError::Auth(format!("token renewal after {status}: {e}")))?;
+                attempt = 0;
+                let wait = (1u64 << auth_failures.min(5)).min(60);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
             }
+
             if status == 200 {
                 match resp.json::<Value>().await {
                     Ok(v) => {
@@ -265,16 +281,17 @@ impl Client {
                     }
                     Err(e) => {
                         last_err = format!("json: {e}");
+                        attempt += 1;
+                        if attempt >= RETRIES {
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_secs_f64(BACKOFF.powi(attempt as i32)))
                             .await;
                         continue;
                     }
                 }
             }
-            if status == 401 || status == 403 {
-                let msg = snippet(&resp.text().await.unwrap_or_default(), 200);
-                return Err(ApiError::Status(status, msg));
-            }
+
             if retriable(status) {
                 let wait = resp
                     .headers()
@@ -283,42 +300,74 @@ impl Client {
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or_else(|| BACKOFF.powi(attempt as i32));
                 self.note_limited(Duration::from_secs_f64(wait));
-                last_err = format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
+                last_err =
+                    format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
+                attempt += 1;
+                if attempt >= RETRIES {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_secs_f64(wait)).await;
                 continue;
             }
-            return Err(ApiError::Status(status, snippet(&resp.text().await.unwrap_or_default(), 300)));
+
+            return Err(ApiError::Status(
+                status,
+                snippet(&resp.text().await.unwrap_or_default(), 300),
+            ));
         }
+
         Err(ApiError::Retries(last_err))
     }
 
-    /// Coverage check: totalCount for a planet-sized box. The API may
-    /// refuse absurd boxes; failure is non-fatal (warned by caller).
+    /// Coverage check: totalCount for a planet-sized box. Authentication
+    /// rejection uses the same self-healing path as ordinary search traffic.
     pub async fn global_total(&self) -> Result<u64, ApiError> {
         let url = format!(
             "{SEARCH_URL}?box=90,-180,-90,180&rad=16000&take=1&skip=0&app=geosweep"
         );
-        self.acquire().await;
-        let token = self.auth_token().await?;
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| ApiError::Retries(format!("network: {e}")))?;
-        if resp.status().as_u16() != 200 {
-            return Err(ApiError::Status(
-                resp.status().as_u16(),
-                snippet(&resp.text().await.unwrap_or_default(), 200),
-            ));
+        let mut auth_failures: u32 = 0;
+
+        loop {
+            self.acquire().await;
+            let token = self.auth_token().await?;
+            let resp = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .map_err(|e| ApiError::Retries(format!("network: {e}")))?;
+
+            let status = resp.status().as_u16();
+            if status == 401 || status == 403 {
+                let detail = snippet(&resp.text().await.unwrap_or_default(), 160);
+                auth_failures += 1;
+                warn!(
+                    "verify auth rejected with http {status} (attempt {auth_failures}): {detail}; rebuilding auth"
+                );
+                self.auth
+                    .refresh_rejected(&token)
+                    .await
+                    .map_err(|e| ApiError::Auth(format!("token renewal after {status}: {e}")))?;
+                let wait = (1u64 << auth_failures.min(5)).min(60);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+
+            if status != 200 {
+                return Err(ApiError::Status(
+                    status,
+                    snippet(&resp.text().await.unwrap_or_default(), 200),
+                ));
+            }
+
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| ApiError::Retries(format!("json: {e}")))?;
+            return Ok(v.get("total").and_then(|t| t.as_u64()).unwrap_or(0));
         }
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| ApiError::Retries(format!("json: {e}")))?;
-        Ok(v.get("total").and_then(|t| t.as_u64()).unwrap_or(0))
     }
 }
 
