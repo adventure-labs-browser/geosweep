@@ -177,15 +177,16 @@ async fn browser_mint(helper: &str, state_path: &str) -> Result<(String, u64)> {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        let output = tokio::process::Command::new("python3")
+        let mut command = tokio::process::Command::new("python3");
+        command
             .arg(helper)
             .arg("--state")
             .arg(state_path)
-            .output()
-            .await;
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(150), command.output()).await;
 
         match output {
-            Ok(out) if out.status.success() => {
+            Ok(Ok(out)) if out.status.success() => {
                 match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     Ok(v) => {
                         let token = v
@@ -217,20 +218,31 @@ async fn browser_mint(helper: &str, state_path: &str) -> Result<(String, u64)> {
                     }
                 }
             }
-            Ok(out) => {
+            Ok(Ok(out)) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let detail: String = stderr.chars().take(500).collect();
+                if out.status.code() == Some(2) {
+                    anyhow::bail!(
+                        "browser auth configuration error: {}",
+                        detail.trim()
+                    );
+                }
                 warn!(
                     "browser auth attempt {attempt} failed (status {}): {}; retrying",
                     out.status,
                     detail.trim()
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     anyhow::bail!("python3 is required for browser authentication");
                 }
                 warn!("browser auth attempt {attempt} could not start ({e}); retrying");
+            }
+            Err(_) => {
+                warn!(
+                    "browser auth attempt {attempt} exceeded 150s; killing it and retrying"
+                );
             }
         }
 
