@@ -34,13 +34,25 @@ jobs:
       - name: Migrate database
         run: ./target/release/geosweep --db data/geosweep.db stats
 
-      - name: Browser login (form login is bot-walled from datacenters)
+      - name: Install browser auth runtime
         run: |
-          pip install -q playwright
-          python -m playwright install chromium --with-deps
-          python3 .github/scripts/gc-login.py
-          test -s gc-storage.json
+          for attempt in 1 2 3 4 5; do
+            if pip install -q playwright && python -m playwright install chromium --with-deps; then
+              exit 0
+            fi
+            echo "browser runtime install attempt $attempt failed; retrying" >&2
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Refresh pass
+        # Rust owns auth for the entire crawl. It asks the Playwright helper
+        # for a bearer, renews before expiry, reuses browser state when valid,
+        # and performs a fresh browser login if the saved session expires.
+        run: env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db refresh
         env:
+          GC_AUTH_HELPER: .github/scripts/gc-login.py
+          GC_BROWSER_STATE: gc-storage.json
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
 
@@ -50,15 +62,8 @@ jobs:
         with:
           name: gc-login-fail
           path: gc-login-fail.png
+          if-no-files-found: ignore
           retention-days: 7
-
-      - name: Refresh pass
-        # Belt-and-suspenders: gc-login never exports GC_BEARER, the CLI
-        # prefers GC_JAR, and this step explicitly removes any inherited
-        # bearer so a one-hour token can never shadow renewable auth.
-        run: env -u GC_BEARER ./target/release/geosweep --db data/geosweep.db refresh
-        env:
-          GC_JAR: gc-storage.json
 
       - name: Validate database before publish
         if: always()

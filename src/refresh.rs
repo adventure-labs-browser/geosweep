@@ -12,6 +12,8 @@ pub struct Args {
     pub password: String,
     pub bearer: String,
     pub jar: String,
+    pub auth_helper: String,
+    pub browser_state: String,
     pub crawl_rate: f64,
 }
 
@@ -19,16 +21,25 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let labs_before = db.labs_count().await?;
     let n = db.requeue_done().await?;
     info!("refresh: {n} crawl cells re-queued");
-    // A renewable browser session always wins over a static bearer.
-    // This is deliberate: GC_BEARER can leak through a parent environment,
-    // while GC_JAR is the only mode suitable for multi-hour refreshes.
-    let client = match crate::auth::select_source(&args.jar, &args.bearer) {
+    // Browser-helper mode is the durable path: it reuses a saved browser
+    // session and performs a fresh browser login whenever that session stops
+    // working. Legacy jar/bearer/form modes remain for manual use.
+    let client = match crate::auth::select_source(
+        &args.auth_helper,
+        &args.jar,
+        &args.bearer,
+    ) {
+        crate::auth::Source::Browser => {
+            info!("refresh: using self-healing browser authentication");
+            Client::new(
+                args.crawl_rate,
+                std::sync::Arc::new(
+                    crate::auth::Auth::browser(&args.auth_helper, &args.browser_state).await?,
+                ),
+            )?
+        }
         crate::auth::Source::Session => {
-            if !args.bearer.is_empty() {
-                info!("refresh: using browser session jar; ignoring inherited static bearer");
-            } else {
-                info!("refresh: using browser session jar");
-            }
+            info!("refresh: using legacy browser session jar");
             Client::new(
                 args.crawl_rate,
                 std::sync::Arc::new(crate::auth::Auth::session(&args.jar).await?),
