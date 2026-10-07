@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tracing::{error, info, warn};
 
-use crate::api::{Client, MAX_SKIP, PAGINATION_LIMIT, TAKE};
+use crate::api::{ApiError, Client, MAX_SKIP, PAGINATION_LIMIT, TAKE};
 use crate::db::{ClaimedCell, Db};
 use crate::geo::{self, Cell};
 
@@ -131,7 +131,7 @@ async fn worker(
         let Some(claimed) = claim_or_wait(&db, &stop).await? else {
             return Ok(());
         };
-        process_cell(&db, &client, claimed, min_radius_m, &stop).await;
+        process_cell(&db, &client, claimed, min_radius_m, &stop).await?;
         processed.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -163,7 +163,7 @@ async fn process_cell(
     claimed: ClaimedCell,
     min_radius_m: f64,
     stop: &Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Result<()> {
     let cell = &claimed.cell;
     let cid = cell.id.clone();
     let mut skip = claimed.next_skip.max(0) as usize;
@@ -179,14 +179,20 @@ async fn process_cell(
                     .await
                 {
                     error!("[{cid}] db error saving page 0: {e}");
-                    return;
+                    return Ok(());
                 }
                 skip = TAKE;
             }
             Err(e) => {
+                if matches!(e, ApiError::Auth(_)) {
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = db.release_claim(cid.clone()).await;
+                    error!("[{cid}] FATAL {e}");
+                    anyhow::bail!("{e}");
+                }
                 let _ = db.mark_failed(cid.clone(), e.to_string()).await;
                 warn!("[{cid}] FAILED: {e}");
-                return;
+                return Ok(());
             }
         }
         if total as i64 > PAGINATION_LIMIT && cell.radius / 2.0 >= min_radius_m {
@@ -200,7 +206,7 @@ async fn process_cell(
                 ),
                 Err(e) => error!("[{cid}] db error on subdivide: {e}"),
             }
-            return;
+            return Ok(());
         }
     } else {
         total = claimed.total_count.unwrap_or(0) as u64;
@@ -215,7 +221,7 @@ async fn process_cell(
         if stop.load(Ordering::SeqCst) {
             let _ = db.release_claim(cid.clone()).await;
             info!("[{cid}] released at skip={skip} — resumes here next run");
-            return;
+            return Ok(());
         }
         match client.search(cell, TAKE, skip).await {
             Ok(page) => {
@@ -230,13 +236,19 @@ async fn process_cell(
                     .await
                 {
                     error!("[{cid}] db error saving page skip={skip}: {e}");
-                    return;
+                    return Ok(());
                 }
                 if n < TAKE {
                     break;
                 }
             }
             Err(e) => {
+                if matches!(e, ApiError::Auth(_)) {
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = db.release_claim(cid.clone()).await;
+                    error!("[{cid}] FATAL at skip={skip}: {e}");
+                    anyhow::bail!("{e}");
+                }
                 let _ = db
                     .mark_failed(cid.clone(), format!("page skip={skip}: {e}"))
                     .await;
@@ -244,7 +256,7 @@ async fn process_cell(
                     "[{cid}] FAILED at skip={skip} (pages saved; \
                      --reset-failed resumes here): {e}"
                 );
-                return;
+                return Ok(());
             }
         }
         skip += TAKE;
@@ -255,4 +267,5 @@ async fn process_cell(
         Ok(()) => info!("[{cid}] MIN-RADIUS PARTIAL total={total} reached_skip={skip}"),
         Err(e) => error!("[{cid}] db error on mark_done: {e}"),
     }
+    Ok(())
 }

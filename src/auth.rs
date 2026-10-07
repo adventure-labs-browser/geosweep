@@ -1,10 +1,10 @@
 //! geocaching.com auth with transparent renewal.
 //!
-//! Three modes, in preference order:
-//!   1. Static bearer (pre-minted by the browser login step). Dies with
-//!      the token (~1h); renewal is impossible, fails loudly.
-//!   2. Session cookies (browser storage_state). Mints fresh bearers via
+//! Three modes:
+//!   1. Session cookies (browser storage_state). Mints fresh bearers via
 //!      the OAuth token endpoint all run long — the durable runner mode.
+//!   2. Static bearer, only as an explicit fallback when no session jar is
+//!      available. It dies with the token (~1h) and cannot renew.
 //!   3. Form login (residential egress only; datacenter IPs are
 //!      bot-walled at the signin page).
 //!
@@ -32,6 +32,26 @@ enum Mode {
     Form { username: String, password: String },
     Session,
     Static,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Session,
+    Static,
+    Form,
+}
+
+/// Session auth must win whenever a jar is present. This intentionally
+/// ignores an inherited GC_BEARER so a short-lived token cannot shadow
+/// renewable browser-session auth.
+pub(crate) fn select_source(jar: &str, bearer: &str) -> Source {
+    if !jar.is_empty() {
+        Source::Session
+    } else if !bearer.is_empty() {
+        Source::Static
+    } else {
+        Source::Form
+    }
 }
 
 pub struct Auth {
@@ -83,42 +103,42 @@ impl Auth {
         }
     }
 
-    /// Valid token, renewing first if stale.
+    /// Valid token, renewing first if stale. The mutex is held through
+    /// renewal so sixteen workers cannot stampede the token endpoint.
     pub async fn token(&self) -> Result<String> {
-        {
-            let st = self.inner.lock().await;
-            if Instant::now() < st.expires_at {
-                return Ok(st.token.clone());
-            }
+        let mut st = self.inner.lock().await;
+        if Instant::now() < st.expires_at {
+            return Ok(st.token.clone());
         }
-        self.refresh().await
+        self.refresh_locked(&mut st).await
     }
 
-    /// Unconditional renewal (after a 401). Returns the new token.
-    pub async fn force_refresh(&self) -> Result<String> {
-        self.refresh().await
+    /// Refresh after a 401, but only if the rejected token is still current.
+    /// If another worker already renewed it, reuse that worker's token.
+    pub async fn refresh_rejected(&self, rejected_token: &str) -> Result<String> {
+        let mut st = self.inner.lock().await;
+        if st.token != rejected_token {
+            return Ok(st.token.clone());
+        }
+        self.refresh_locked(&mut st).await
     }
 
-    async fn refresh(&self) -> Result<String> {
-        let mode: Option<(String, String)> = {
-            let st = self.inner.lock().await;
-            match &st.mode {
-                Mode::Form { username, password } => {
-                    Some((username.clone(), password.clone()))
-                }
-                Mode::Session => None,
-                Mode::Static => {
-                    anyhow::bail!(
-                        "static bearer expired mid-run; re-mint it in the login step"
-                    )
-                }
+    async fn refresh_locked(&self, st: &mut AuthState) -> Result<String> {
+        let credentials = match &st.mode {
+            Mode::Form { username, password } => {
+                Some((username.clone(), password.clone()))
+            }
+            Mode::Session => None,
+            Mode::Static => {
+                anyhow::bail!(
+                    "static bearer expired mid-run; use a renewable session jar"
+                )
             }
         };
-        if let Some((u, p)) = mode {
+        if let Some((u, p)) = credentials {
             form_login(&self.http, &u, &p).await?;
         }
         let (token, expires_in) = mint(&self.http).await?;
-        let mut st = self.inner.lock().await;
         st.token = token.clone();
         st.expires_at =
             Instant::now() + Duration::from_secs(expires_in.saturating_sub(EXPIRY_SKEW_SECS));
@@ -239,4 +259,20 @@ fn extract_token(page: &str) -> Result<String> {
         .find('"')
         .context("token value unterminated")?;
     Ok(rest[start..start + end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_source, Source};
+
+    #[test]
+    fn session_jar_always_beats_static_bearer() {
+        assert_eq!(select_source("gc-storage.json", "stale-token"), Source::Session);
+    }
+
+    #[test]
+    fn static_bearer_is_only_used_without_a_jar() {
+        assert_eq!(select_source("", "token"), Source::Static);
+        assert_eq!(select_source("", ""), Source::Form);
+    }
 }

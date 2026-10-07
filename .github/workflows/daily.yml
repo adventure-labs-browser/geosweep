@@ -38,10 +38,8 @@ jobs:
         run: |
           pip install -q playwright
           python -m playwright install chromium --with-deps
-          python3 .github/scripts/gc-login.py > /tmp/bearer.env
-          head -n 1 /tmp/bearer.env
-          tail -n +2 /tmp/bearer.env >> "$GITHUB_ENV"
-          rm -f /tmp/bearer.env
+          python3 .github/scripts/gc-login.py
+          test -s gc-storage.json
         env:
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
@@ -55,9 +53,10 @@ jobs:
           retention-days: 7
 
       - name: Refresh pass
-        # NOTE: GC_BEARER is deliberately NOT passed: a static bearer
-        # dies mid-run and shadows the self-renewing session jar.
-        run: ./target/release/geosweep --db data/geosweep.db refresh
+        # Belt-and-suspenders: gc-login never exports GC_BEARER, the CLI
+        # prefers GC_JAR, and this step explicitly removes any inherited
+        # bearer so a one-hour token can never shadow renewable auth.
+        run: env -u GC_BEARER ./target/release/geosweep --db data/geosweep.db refresh
         env:
           GC_JAR: gc-storage.json
 
@@ -66,7 +65,7 @@ jobs:
         id: dbcheck
         run: |
           python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
-          import sqlite3, os
+          import sqlite3, os, sys
           ok = False
           try:
               assert os.path.getsize('data/geosweep.db') > 100_000
@@ -76,12 +75,15 @@ jobs:
                   "SELECT name FROM sqlite_master WHERE type='table'")}
               assert {'queue', 'caches', 'cache_versions', 'meta'}.issubset(tables)
               qfailed = db.execute("SELECT COUNT(*) FROM queue WHERE status='failed'").fetchone()[0]
+              qpending = db.execute("SELECT COUNT(*) FROM queue WHERE status='pending'").fetchone()[0]
+              qactive = db.execute("SELECT COUNT(*) FROM queue WHERE status='in_progress'").fetchone()[0]
               ncaches = db.execute('SELECT COUNT(*) FROM caches').fetchone()[0]
               assert qfailed <= 5, f'{qfailed} failed cells (a few bad cells are tolerated, a wave is not)'
+              assert qpending == 0 and qactive == 0, f'incomplete crawl: pending={qpending} in_progress={qactive}'
               assert ncaches > 0, 'zero caches'
               ok = True
           except Exception as e:
-              print(f'validation failed: {e}')
+              print(f'validation failed: {e}', file=sys.stderr)
           print(f'valid={str(ok).lower()}')
           PYEOF
 

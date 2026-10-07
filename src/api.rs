@@ -44,6 +44,8 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub enum ApiError {
+    /// Authentication cannot continue without intervention.
+    Auth(String),
     /// Permanent HTTP failure (non-retriable status).
     Status(u16, String),
     /// All retry attempts exhausted.
@@ -53,6 +55,7 @@ pub enum ApiError {
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ApiError::Auth(m) => write!(f, "authentication failed: {m}"),
             ApiError::Status(c, s) => write!(f, "http {c}: {s}"),
             ApiError::Retries(m) => write!(f, "max retries exceeded: {m}"),
         }
@@ -196,13 +199,11 @@ impl Client {
         self.adaptive.lock().unwrap().cut(retry_after);
     }
 
-    async fn auth_header(&self) -> Result<String, ApiError> {
-        let token = self
-            .auth
+    async fn auth_token(&self) -> Result<String, ApiError> {
+        self.auth
             .token()
             .await
-            .map_err(|e| ApiError::Retries(format!("auth refresh: {e}")))?;
-        Ok(format!("Bearer {token}"))
+            .map_err(|e| ApiError::Auth(format!("token refresh: {e}")))
     }
 
     /// One box page. Retries retriable statuses with backoff.
@@ -221,11 +222,11 @@ impl Client {
         let mut refreshed = false;
         for attempt in 0..RETRIES {
             self.acquire().await;
-            let auth = self.auth_header().await?;
+            let token = self.auth_token().await?;
             let resp = match self
                 .http
                 .get(&url)
-                .header("Authorization", auth)
+                .header("Authorization", format!("Bearer {token}"))
                 .header("Accept", "application/json")
                 .send()
                 .await
@@ -242,13 +243,10 @@ impl Client {
             if status == 401 && !refreshed {
                 // Token died mid-run: one transparent re-login, then retry.
                 refreshed = true;
-                match self.auth.force_refresh().await {
+                match self.auth.refresh_rejected(&token).await {
                     Ok(_) => continue,
                     Err(e) => {
-                        return Err(ApiError::Status(
-                            401,
-                            format!("token renewal failed: {e}"),
-                        ))
+                        return Err(ApiError::Auth(format!("token renewal after 401: {e}")))
                     }
                 }
             }
@@ -301,11 +299,11 @@ impl Client {
             "{SEARCH_URL}?box=90,-180,-90,180&rad=16000&take=1&skip=0&app=geosweep"
         );
         self.acquire().await;
-        let auth = self.auth_header().await?;
+        let token = self.auth_token().await?;
         let resp = self
             .http
             .get(&url)
-            .header("Authorization", auth)
+            .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/json")
             .send()
             .await

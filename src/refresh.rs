@@ -19,26 +19,34 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let labs_before = db.labs_count().await?;
     let n = db.requeue_done().await?;
     info!("refresh: {n} crawl cells re-queued");
-    // Bearer > session jar > form login. The jar self-renews all
-    // run long; the bearer dies with its 1h token; form login only
-    // works from non-walled egress.
-    let client = if !args.bearer.is_empty() {
-        info!("refresh: using pre-minted bearer");
-        Client::new(
-            args.crawl_rate,
-            std::sync::Arc::new(crate::auth::Auth::static_token(&args.bearer)),
-        )?
-    } else if !args.jar.is_empty() {
-        info!("refresh: using browser session jar");
-        Client::new(
-            args.crawl_rate,
-            std::sync::Arc::new(crate::auth::Auth::session(&args.jar).await?),
-        )?
-    } else {
-        let auth =
-            std::sync::Arc::new(crate::auth::Auth::login(&args.username, &args.password).await?);
-        info!("refresh: logged in, starting crawl");
-        Client::new(args.crawl_rate, auth)?
+    // A renewable browser session always wins over a static bearer.
+    // This is deliberate: GC_BEARER can leak through a parent environment,
+    // while GC_JAR is the only mode suitable for multi-hour refreshes.
+    let client = match crate::auth::select_source(&args.jar, &args.bearer) {
+        crate::auth::Source::Session => {
+            if !args.bearer.is_empty() {
+                info!("refresh: using browser session jar; ignoring inherited static bearer");
+            } else {
+                info!("refresh: using browser session jar");
+            }
+            Client::new(
+                args.crawl_rate,
+                std::sync::Arc::new(crate::auth::Auth::session(&args.jar).await?),
+            )?
+        }
+        crate::auth::Source::Static => {
+            info!("refresh: using pre-minted bearer (non-renewable)");
+            Client::new(
+                args.crawl_rate,
+                std::sync::Arc::new(crate::auth::Auth::static_token(&args.bearer)),
+            )?
+        }
+        crate::auth::Source::Form => {
+            let auth =
+                std::sync::Arc::new(crate::auth::Auth::login(&args.username, &args.password).await?);
+            info!("refresh: logged in, starting crawl");
+            Client::new(args.crawl_rate, auth)?
+        }
     };
     crawl::run(
         db.clone(),
