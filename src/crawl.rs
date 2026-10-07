@@ -4,7 +4,7 @@
 //! totalCount exceeds PAGINATION_LIMIT subdivides (boxes tile exactly,
 //! so unlike circular queries there are no geometric gaps); smaller
 //! cells paginate fully (every total <= limit is reachable — the last
-//! page is skip=9000+take=500, window ending at the ~10000 cliff).
+//! page is skip=9000+take=1000, ending at the ~10000 window cliff).
 //! The SQLite queue makes everything resumable at page granularity.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,34 @@ use crate::db::{ClaimedCell, Db};
 use crate::geo::{self, Cell};
 
 const STALE_CELL_SECS: i64 = 600;
+/// Skip up to three known-overfull intermediate quad-tree levels in one go.
+/// 4^3 = 64 leaves is aggressive enough to save probes without exploding the
+/// queue when a parent's density is very uneven.
+const MAX_EAGER_SPLIT_DEPTH: u32 = 3;
+
+fn choose_split_depth(total: u64, radius_m: f64, min_radius_m: f64) -> u32 {
+    let mut max_depth = 0;
+    let mut radius = radius_m;
+    while max_depth < MAX_EAGER_SPLIT_DEPTH && radius / 2.0 >= min_radius_m {
+        max_depth += 1;
+        radius /= 2.0;
+    }
+    if max_depth == 0 || total <= PAGINATION_LIMIT as u64 {
+        return 0;
+    }
+
+    // If density were uniform, depth d gives 4^d leaves. Jump directly to
+    // the shallowest level whose average leaf fits under the API window.
+    // Skewed leaves are still measured and can split again normally.
+    let limit = PAGINATION_LIMIT as u64;
+    let mut depth = 1;
+    let mut capacity = limit.saturating_mul(4);
+    while depth < max_depth && total > capacity {
+        depth += 1;
+        capacity = capacity.saturating_mul(4);
+    }
+    depth
+}
 
 pub struct Args {
     pub concurrency: usize,
@@ -195,14 +223,15 @@ async fn process_cell(
                 return Ok(());
             }
         }
-        if total as i64 > PAGINATION_LIMIT && cell.radius / 2.0 >= min_radius_m {
-            let children = geo::subdivide(cell);
+        let depth = choose_split_depth(total, cell.radius, min_radius_m);
+        if depth > 0 {
+            let children = geo::subdivide_depth(cell, depth);
             let n = children.len();
+            let child_radius = cell.radius / 2_f64.powi(depth as i32);
             match db.subdivide(cid.clone(), children).await {
                 Ok(()) => info!(
-                    "[{cid}] SPLIT -> {n} children at radius {:.0}m \
-                     (total={total} > {PAGINATION_LIMIT})",
-                    cell.radius / 2.0
+                    "[{cid}] SPLIT x{depth} -> {n} descendants at radius {child_radius:.0}m \
+                     (total={total} > {PAGINATION_LIMIT})"
                 ),
                 Err(e) => error!("[{cid}] db error on subdivide: {e}"),
             }
@@ -268,4 +297,23 @@ async fn process_cell(
         Err(e) => error!("[{cid}] db error on mark_done: {e}"),
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_cells_skip_multiple_levels() {
+        assert_eq!(choose_split_depth(10_000, 3_000_000.0, 1_000.0), 1);
+        assert_eq!(choose_split_depth(100_000, 3_000_000.0, 1_000.0), 2);
+        assert_eq!(choose_split_depth(1_000_000, 3_000_000.0, 1_000.0), 3);
+    }
+
+    #[test]
+    fn split_depth_respects_min_radius() {
+        assert_eq!(choose_split_depth(1_000_000, 1_500.0, 1_000.0), 0);
+        assert_eq!(choose_split_depth(1_000_000, 2_000.0, 1_000.0), 1);
+    }
 }

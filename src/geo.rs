@@ -66,3 +66,38 @@ pub fn subdivide(c: &Cell) -> Vec<Cell> {
         Cell::new(c.lat + half_lat, c.lon + half_lon, r),
     ]
 }
+
+/// Recursively split to exactly depth levels and return only the leaf
+/// descendants. This is geometrically identical to repeatedly processing
+/// every intermediate quad-tree node, but lets dense cells skip pointless
+/// probe requests at levels that are guaranteed to remain overfull.
+pub fn subdivide_depth(c: &Cell, depth: u32) -> Vec<Cell> {
+    if depth == 0 {
+        return vec![c.clone()];
+    }
+    let mut level = vec![c.clone()];
+    for _ in 0..depth {
+        level = level.iter().flat_map(subdivide).collect();
+    }
+    level
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_split_matches_recursive_quadtree() {
+        let root = Cell::new(40.0, -100.0, 3_000_000.0);
+        let expected: Vec<Cell> = subdivide(&root)
+            .iter()
+            .flat_map(subdivide)
+            .collect();
+        let actual = subdivide_depth(&root, 2);
+        assert_eq!(actual.len(), 16);
+        assert_eq!(
+            actual.iter().map(|c| &c.id).collect::<Vec<_>>(),
+            expected.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+    }
+}

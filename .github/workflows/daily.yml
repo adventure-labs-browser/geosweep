@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: geosweep-daily
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -61,10 +65,13 @@ jobs:
           GC_PASS: ${{ secrets.GC_PASS }}
 
       - name: Refresh pass
-        # Rust owns auth for the entire crawl. It asks the Playwright helper
-        # for a bearer, renews before expiry, reuses browser state when valid,
-        # and performs a fresh browser login if the saved session expires.
-        run: env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db refresh
+        # Stop cleanly before GitHub's six-hour job ceiling so the partial
+        # database can be validated and published as a resumable checkpoint.
+        # Rust owns auth for the entire crawl and handles SIGTERM gracefully.
+        run: |
+          timeout --preserve-status --signal=TERM --kill-after=2m 300m \
+            env -u GC_BEARER -u GC_JAR \
+            ./target/release/geosweep --db data/geosweep.db refresh
         env:
           GC_AUTH_HELPER: .github/scripts/gc-login.py
           GC_BROWSER_STATE: gc-storage.json
@@ -99,8 +106,10 @@ jobs:
               qactive = db.execute("SELECT COUNT(*) FROM queue WHERE status='in_progress'").fetchone()[0]
               ncaches = db.execute('SELECT COUNT(*) FROM caches').fetchone()[0]
               assert qfailed <= 5, f'{qfailed} failed cells (a few bad cells are tolerated, a wave is not)'
-              assert qpending == 0 and qactive == 0, f'incomplete crawl: pending={qpending} in_progress={qactive}'
+              assert qactive == 0, f'unclean checkpoint: {qactive} cells still in_progress'
               assert ncaches > 0, 'zero caches'
+              complete = qpending == 0 and qfailed == 0
+              print(f'checkpoint: caches={ncaches} pending={qpending} failed={qfailed} complete={complete}', file=sys.stderr)
               ok = True
           except Exception as e:
               print(f'validation failed: {e}', file=sys.stderr)
@@ -120,7 +129,7 @@ jobs:
           gh release delete db-latest -y --cleanup-tag || true
           gh release create db-latest /tmp/geosweep.db.zst \
             --title "geosweep db $(date -u +%F)" \
-            --notes "Rolling database snapshot."
+            --notes "Rolling database snapshot/checkpoint. Incomplete discovery is resumed next run without re-walking completed leaves."
           gh release list --json tagName,createdAt \
             --jq '[.[] | select(.tagName | startswith("db-20")) | .tagName] | sort | .[:-7] | .[]' \
             | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done

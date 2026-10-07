@@ -19,8 +19,22 @@ pub struct Args {
 
 pub async fn run(db: Db, args: Args) -> Result<()> {
     let labs_before = db.labs_count().await?;
-    let n = db.requeue_done().await?;
-    info!("refresh: {n} crawl cells re-queued");
+    let before = db.stats().await?;
+    if before.pending > 0 || before.in_progress > 0 || before.failed > 0 {
+        // A previous bounded run stopped before worldwide discovery finished.
+        // Resume only unfinished work; re-queuing completed leaves here would
+        // throw away most of the checkpointing benefit.
+        let retried = db.reset_failed().await?;
+        info!(
+            "refresh: resuming incomplete discovery — {} pending, {} in_progress,              {} failed re-queued; completed leaves stay done",
+            before.pending,
+            before.in_progress,
+            retried
+        );
+    } else {
+        let n = db.requeue_done().await?;
+        info!("refresh: complete baseline — {n} crawl cells re-queued for refresh");
+    }
     // Keep every configured credential source available. Renewal always
     // retries the complete chain instead of committing to whichever source
     // happened to work first.
