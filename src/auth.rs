@@ -1,10 +1,17 @@
-//! geocaching.com website auth: form login -> session cookies ->
-//! OAuth bearer for the api-proxy, with transparent refresh.
+//! geocaching.com auth with transparent renewal.
 //!
-//! The website token lives ~1h; a full crawl runs for hours, so the
-//! client re-logs-in proactively before expiry and reactively on 401.
-//! Tokens live in memory ONLY (never written to the db).
+//! Three modes, in preference order:
+//!   1. Static bearer (pre-minted by the browser login step). Dies with
+//!      the token (~1h); renewal is impossible, fails loudly.
+//!   2. Session cookies (browser storage_state). Mints fresh bearers via
+//!      the OAuth token endpoint all run long — the durable runner mode.
+//!   3. Form login (residential egress only; datacenter IPs are
+//!      bot-walled at the signin page).
+//!
+//! Tokens and cookies live in memory (+ the ephemeral storage_state file
+//! in the workspace, never uploaded). Nothing is written to the db.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -15,23 +22,6 @@ const TOKEN_URL: &str = "https://www.geocaching.com/account/oauth/token";
 /// Refresh ahead of the stated expiry by this much.
 const EXPIRY_SKEW_SECS: u64 = 300;
 
-/// Extract __RequestVerificationToken from the signin page HTML.
-fn extract_token(page: &str) -> Result<String> {
-    let key = r#"name="__RequestVerificationToken""#;
-    let i = page
-        .find(key)
-        .context("signin page has no verification token")?;
-    let rest = &page[i..];
-    let v = rest
-        .find("value=\"")
-        .context("token has no value")?;
-    let start = v + "value=\"".len();
-    let end = rest[start..]
-        .find('"')
-        .context("token value unterminated")?;
-    Ok(rest[start..start + end].to_string())
-}
-
 struct AuthState {
     mode: Mode,
     token: String,
@@ -39,20 +29,24 @@ struct AuthState {
 }
 
 enum Mode {
-    /// Website credentials: can re-login any time.
-    Login { username: String, password: String },
-    /// Pre-minted bearer (e.g. via browser login step): cannot renew.
+    Form { username: String, password: String },
+    Session,
     Static,
 }
 
 pub struct Auth {
+    http: reqwest::Client,
     inner: tokio::sync::Mutex<AuthState>,
 }
 
 impl Auth {
+    /// Full form login (residential only).
     pub async fn login(username: &str, password: &str) -> Result<Self> {
-        let (token, expires_in) = do_login(username, password).await?;
-        Ok(Self::from_parts(
+        let http = base_client(None)?;
+        form_login(&http, username, password).await?;
+        let (token, expires_in) = mint(&http).await?;
+        Ok(Self::wrap(
+            http,
             Mode::Login {
                 username: username.to_string(),
                 password: password.to_string(),
@@ -62,15 +56,24 @@ impl Auth {
         ))
     }
 
-    /// Wrap an externally minted bearer (browser login step). Expiry is
-    /// unknown; assume one hour from now. Renewal is impossible — a
-    /// stale static bearer fails loudly instead of re-logging-in wrong.
-    pub fn static_token(token: &str) -> Self {
-        Self::from_parts(Mode::Static, token.to_string(), 3600)
+    /// Session-cookie mode: loads a browser storage_state file, mints the
+    /// first bearer from it, renews the same way forever after.
+    pub async fn session(jar_path: &str) -> Result<Self> {
+        let http = base_client(Some(load_jar(jar_path)?))?;
+        let (token, expires_in) = mint(&http).await?;
+        Ok(Self::wrap(http, Mode::Session, token, expires_in))
     }
 
-    fn from_parts(mode: Mode, token: String, expires_in: u64) -> Self {
+    /// Wrap an externally minted bearer. Expiry unknown (~1h); renewal
+    /// is impossible and fails loudly instead of re-logging-in wrong.
+    pub fn static_token(token: &str) -> Self {
+        let http = base_client(None).expect("tls client builds");
+        Self::wrap(http, Mode::Static, token.to_string(), 3600)
+    }
+
+    fn wrap(http: reqwest::Client, mode: Mode, token: String, expires_in: u64) -> Self {
         Self {
+            http,
             inner: tokio::sync::Mutex::new(AuthState {
                 mode,
                 token,
@@ -80,7 +83,7 @@ impl Auth {
         }
     }
 
-    /// Valid token, refreshing first if stale.
+    /// Valid token, renewing first if stale.
     pub async fn token(&self) -> Result<String> {
         {
             let st = self.inner.lock().await;
@@ -91,18 +94,19 @@ impl Auth {
         self.refresh().await
     }
 
-    /// Unconditional re-login (after a 401). Returns the new token.
+    /// Unconditional renewal (after a 401). Returns the new token.
     pub async fn force_refresh(&self) -> Result<String> {
         self.refresh().await
     }
 
     async fn refresh(&self) -> Result<String> {
-        let mode = {
+        let mode: Option<(String, String)> = {
             let st = self.inner.lock().await;
             match &st.mode {
                 Mode::Login { username, password } => {
-                    (username.clone(), password.clone())
+                    Some((username.clone(), password.clone()))
                 }
+                Mode::Session => None,
                 Mode::Static => {
                     anyhow::bail!(
                         "static bearer expired mid-run; re-mint it in the login step"
@@ -110,8 +114,10 @@ impl Auth {
                 }
             }
         };
-        let (u, p) = mode;
-        let (token, expires_in) = do_login(&u, &p).await?;
+        if let Some((u, p)) = mode {
+            form_login(&self.http, &u, &p).await?;
+        }
+        let (token, expires_in) = mint(&self.http).await?;
         let mut st = self.inner.lock().await;
         st.token = token.clone();
         st.expires_at =
@@ -120,13 +126,51 @@ impl Auth {
     }
 }
 
-/// Full login flow. Returns (bearer token, expires_in seconds).
-async fn do_login(username: &str, password: &str) -> Result<(String, u64)> {
-    let http = reqwest::Client::builder()
+fn base_client(jar: Option<reqwest::cookie::Jar>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
-        .user_agent(crate::api::USER_AGENT)
-        .cookie_store(true)
-        .build()?;
+        .user_agent(crate::api::USER_AGENT);
+    b = match jar {
+        Some(j) => b.cookie_provider(Arc::new(j)),
+        None => b.cookie_store(true),
+    };
+    Ok(b.build()?)
+}
+
+/// Load a Playwright storage_state file into a cookie jar.
+fn load_jar(path: &str) -> Result<reqwest::cookie::Jar> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).context("read cookie jar")?)?;
+    let jar = reqwest::cookie::Jar::default();
+    let cookies = v
+        .get("cookies")
+        .and_then(|c| c.as_array())
+        .context("storage_state has no cookies")?;
+    for ck in cookies {
+        let (Some(name), Some(value)) = (
+            ck.get("name").and_then(|s| s.as_str()),
+            ck.get("value").and_then(|s| s.as_str()),
+        ) else {
+            continue;
+        };
+        let domain = ck
+            .get("domain")
+            .and_then(|s| s.as_str())
+            .unwrap_or(".geocaching.com");
+        let url = format!("https://{}/", domain.trim_start_matches('.'))
+            .parse()
+            .context("cookie url")?;
+        jar.add_cookie_str(&format!("{name}={value}"), &url);
+    }
+    Ok(jar)
+}
+
+/// Website form login into the client's cookie store/session.
+async fn form_login(
+    http: &reqwest::Client,
+    username: &str,
+    password: &str,
+) -> Result<()> {
     let signin_resp = http.get(SIGNIN_URL).send().await.context("signin page fetch")?;
     let signin_status = signin_resp.status();
     let page = signin_resp.text().await.unwrap_or_default();
@@ -148,26 +192,26 @@ async fn do_login(username: &str, password: &str) -> Result<(String, u64)> {
         .await
         .context("login post")?;
     let login_status = login_resp.status();
-    let login_body = login_resp.text().await.unwrap_or_default();
-    // A 200 can still be a bot-check or failed-login page: the proof is
-    // whether the token endpoint then yields a JWT.
+    let _ = login_resp.text().await.unwrap_or_default();
+    if !login_status.is_success() {
+        anyhow::bail!("login post http {login_status}");
+    }
+    Ok(())
+}
+
+/// Mint an api-proxy bearer from the client's session cookies.
+async fn mint(http: &reqwest::Client) -> Result<(String, u64)> {
     let tok_resp = http.get(TOKEN_URL).send().await.context("oauth token fetch")?;
     let tok_status = tok_resp.status();
     let tok_body = tok_resp.text().await.unwrap_or_default();
     if !tok_status.is_success() {
         anyhow::bail!(
-            "oauth token http {tok_status} (login post was {login_status}, {} bytes): {}",
-            login_body.len(),
+            "oauth token http {tok_status}: {}",
             tok_body.chars().take(200).collect::<String>()
         );
     }
-    let tok: serde_json::Value = serde_json::from_str(&tok_body).with_context(|| {
-        format!(
-            "oauth token json (login post was {login_status}, {} bytes): {}",
-            login_body.len(),
-            tok_body.chars().take(200).collect::<String>()
-        )
-    })?;
+    let tok: serde_json::Value =
+        serde_json::from_str(&tok_body).context("oauth token json")?;
     let access = tok
         .get("access_token")
         .and_then(|t| t.as_str())
@@ -178,4 +222,21 @@ async fn do_login(username: &str, password: &str) -> Result<(String, u64)> {
         .and_then(|e| e.as_u64())
         .unwrap_or(3600);
     Ok((access, expires_in))
+}
+
+/// Extract __RequestVerificationToken from the signin page HTML.
+fn extract_token(page: &str) -> Result<String> {
+    let key = r#"name="__RequestVerificationToken""#;
+    let i = page
+        .find(key)
+        .context("signin page has no verification token")?;
+    let rest = &page[i..];
+    let v = rest
+        .find("value=\"")
+        .context("token has no value")?;
+    let start = v + "value=\"".len();
+    let end = rest[start..]
+        .find('"')
+        .context("token value unterminated")?;
+    Ok(rest[start..start + end].to_string())
 }

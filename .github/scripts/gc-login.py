@@ -51,10 +51,11 @@ def fail(page, msg):
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
-    page = browser.new_page(
+    context = browser.new_context(
         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     )
+    page = context.new_page()
     try:
         page.goto(SIGNIN, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
@@ -78,6 +79,9 @@ with sync_playwright() as p:
             fail(page, "no redirect to /play after submit")
         resp = page.goto(TOKEN, timeout=60000)
         body = resp.text() if resp else ""
+        # Persist the session (cookies) so the scraper can mint fresh
+        # bearers itself all run long — the bearer below is only the first.
+        context.storage_state(path="gc-storage.json")
     except SystemExit:
         raise
     except Exception as e:

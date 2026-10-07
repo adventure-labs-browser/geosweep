@@ -57,6 +57,7 @@ jobs:
       - name: Refresh pass
         run: ./target/release/geosweep --db data/geosweep.db refresh
         env:
+          GC_JAR: gc-storage.json
           GC_BEARER: ${{ env.GC_BEARER }}
 
       - name: Validate database before publish

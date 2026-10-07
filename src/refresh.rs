@@ -11,6 +11,7 @@ pub struct Args {
     pub username: String,
     pub password: String,
     pub bearer: String,
+    pub jar: String,
     pub crawl_rate: f64,
 }
 
@@ -18,11 +19,20 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let labs_before = db.labs_count().await?;
     let n = db.requeue_done().await?;
     info!("refresh: {n} crawl cells re-queued");
+    // Bearer > session jar > form login. The jar self-renews all
+    // run long; the bearer dies with its 1h token; form login only
+    // works from non-walled egress.
     let client = if !args.bearer.is_empty() {
         info!("refresh: using pre-minted bearer");
         Client::new(
             args.crawl_rate,
             std::sync::Arc::new(crate::auth::Auth::static_token(&args.bearer)),
+        )?
+    } else if !args.jar.is_empty() {
+        info!("refresh: using browser session jar");
+        Client::new(
+            args.crawl_rate,
+            std::sync::Arc::new(crate::auth::Auth::session(&args.jar).await?),
         )?
     } else {
         let auth =
