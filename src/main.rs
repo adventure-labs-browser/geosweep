@@ -42,6 +42,9 @@ enum Cmd {
         /// use when datacenter egress is bot-walled.
         #[arg(long, env = "GC_BEARER", default_value = "")]
         bearer: String,
+        /// Browser session jar (env: GC_JAR). Self-renewing all run long.
+        #[arg(long, env = "GC_JAR", default_value = "")]
+        jar: String,
         /// Number of fibonacci-sphere seed cells.
         #[arg(long, default_value_t = 16)]
         seeds: usize,
@@ -72,6 +75,9 @@ enum Cmd {
         /// Pre-minted bearer (env: GC_BEARER). Skips form login.
         #[arg(long, env = "GC_BEARER", default_value = "")]
         bearer: String,
+        /// Browser session jar (env: GC_JAR). Self-renewing all run long.
+        #[arg(long, env = "GC_JAR", default_value = "")]
+        jar: String,
         /// Max aggregate requests/sec (adaptive limiter starts here
         /// and finds the ceiling on its own).
         #[arg(long, default_value_t = 5.0)]
@@ -82,11 +88,17 @@ enum Cmd {
     /// Compare local cache count against the API's global totalCount.
     Verify {
         /// Geocaching username (env: GC_USER).
-        #[arg(long, env = "GC_USER")]
+        #[arg(long, env = "GC_USER", default_value = "")]
         username: String,
         /// Geocaching password (env: GC_PASS).
-        #[arg(long, env = "GC_PASS")]
+        #[arg(long, env = "GC_PASS", default_value = "")]
         password: String,
+        /// Pre-minted bearer (env: GC_BEARER).
+        #[arg(long, env = "GC_BEARER", default_value = "")]
+        bearer: String,
+        /// Browser session jar (env: GC_JAR).
+        #[arg(long, env = "GC_JAR", default_value = "")]
+        jar: String,
     },
     /// Test website credentials (logs in, prints result).
     Auth {
@@ -111,17 +123,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let db = db::Db::open(&cli.db)?;
 
-    async fn authed(rate: f64, username: &str, password: &str) -> Result<api::Client> {
-        let auth = std::sync::Arc::new(auth::Auth::login(username, password).await?);
-        println!("logged in");
+    async fn authed(
+        rate: f64,
+        username: &str,
+        password: &str,
+        bearer: &str,
+        jar: &str,
+    ) -> Result<api::Client> {
+        // Bearer > session jar > form login.
+        let auth = if !bearer.is_empty() {
+            println!("using pre-minted bearer");
+            std::sync::Arc::new(auth::Auth::static_token(bearer))
+        } else if !jar.is_empty() {
+            println!("using browser session jar");
+            std::sync::Arc::new(auth::Auth::session(jar).await?)
+        } else {
+            println!("logging in");
+            std::sync::Arc::new(auth::Auth::login(username, password).await?)
+        };
         api::Client::new(rate, auth)
-    }
-
-    /// Client from a pre-minted bearer (browser login step). Use when
-    /// direct form login is bot-walled (datacenter egress).
-    async fn authed_bearer(rate: f64, bearer: &str) -> Result<api::Client> {
-        println!("using pre-minted bearer");
-        api::Client::new(rate, std::sync::Arc::new(auth::Auth::static_token(bearer)))
     }
 
     match cli.cmd {
@@ -131,6 +151,7 @@ async fn main() -> Result<()> {
             username,
             password,
             bearer,
+            jar,
             seeds,
             seed_radius_m,
             min_radius_m,
@@ -138,11 +159,7 @@ async fn main() -> Result<()> {
             reset,
             reset_failed,
         } => {
-            let client = if !bearer.is_empty() {
-                authed_bearer(rate, &bearer).await?
-            } else {
-                authed(rate, &username, &password).await?
-            };
+            let client = authed(rate, &username, &password, &bearer, &jar).await?;
             crawl::run(
                 db,
                 client,
@@ -162,6 +179,7 @@ async fn main() -> Result<()> {
             username,
             password,
             bearer,
+            jar,
             crawl_rate,
         } => {
             refresh::run(
@@ -170,6 +188,7 @@ async fn main() -> Result<()> {
                     username,
                     password,
                     bearer,
+                    jar,
                     crawl_rate,
                 },
             )
@@ -179,8 +198,13 @@ async fn main() -> Result<()> {
             println!("{}", db.stats().await?);
             Ok(())
         }
-        Cmd::Verify { username, password } => {
-            let client = authed(5.0, &username, &password).await?;
+        Cmd::Verify {
+            username,
+            password,
+            bearer,
+            jar,
+        } => {
+            let client = authed(5.0, &username, &password, &bearer, &jar).await?;
             crawl::verify_global(&db, &client).await;
             Ok(())
         }
