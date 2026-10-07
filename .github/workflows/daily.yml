@@ -36,14 +36,17 @@ jobs:
 
       - name: Install browser auth runtime
         run: |
-          for attempt in 1 2 3 4 5; do
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
             if pip install -q playwright && python -m playwright install chromium --with-deps; then
               exit 0
             fi
-            echo "browser runtime install attempt $attempt failed; retrying" >&2
-            sleep $((attempt * 10))
+            wait=$((attempt * 10))
+            if [ "$wait" -gt 60 ]; then wait=60; fi
+            echo "browser runtime install attempt $attempt failed; retrying in ${wait}s" >&2
+            sleep "$wait"
           done
-          exit 1
 
       - name: Prove auth recovery paths
         run: |
