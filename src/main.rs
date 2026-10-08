@@ -12,7 +12,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "geosweep", version, about = "Traditional geocache location mirror")]
+#[command(
+    name = "geosweep",
+    version,
+    about = "Traditional geocache location mirror"
+)]
 struct Cli {
     /// SQLite database path.
     #[arg(long, global = true, default_value = "data/geosweep.db")]
@@ -63,6 +67,9 @@ enum Cmd {
         /// Stop after N processed cells (0 = unlimited).
         #[arg(long, default_value_t = 0)]
         max_cells: usize,
+        /// Gracefully stop after N seconds and leave a resumable checkpoint (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        max_runtime_secs: u64,
         /// Wipe the queue + discovered caches and start over.
         #[arg(long)]
         reset: bool,
@@ -94,6 +101,9 @@ enum Cmd {
         /// and finds the ceiling on its own).
         #[arg(long, default_value_t = 10.0)]
         crawl_rate: f64,
+        /// Gracefully stop discovery after N seconds (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        crawl_budget_secs: u64,
     },
     /// Print queue/cache counts.
     Stats,
@@ -121,7 +131,11 @@ enum Cmd {
     /// Prove browser auth can log in and then renew in-process.
     AuthBrowser {
         /// Browser auth helper (env: GC_AUTH_HELPER).
-        #[arg(long, env = "GC_AUTH_HELPER", default_value = ".github/scripts/gc-login.py")]
+        #[arg(
+            long,
+            env = "GC_AUTH_HELPER",
+            default_value = ".github/scripts/gc-login.py"
+        )]
         auth_helper: String,
         /// Playwright storage-state path used by the browser auth helper.
         #[arg(long, env = "GC_BROWSER_STATE", default_value = "gc-storage.json")]
@@ -142,8 +156,7 @@ enum Cmd {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -161,15 +174,8 @@ async fn main() -> Result<()> {
     ) -> Result<api::Client> {
         println!("using resilient authentication chain");
         let auth = std::sync::Arc::new(
-            auth::Auth::resilient(
-                auth_helper,
-                browser_state,
-                jar,
-                bearer,
-                username,
-                password,
-            )
-            .await?,
+            auth::Auth::resilient(auth_helper, browser_state, jar, bearer, username, password)
+                .await?,
         );
         api::Client::new(rate, auth)
     }
@@ -188,6 +194,7 @@ async fn main() -> Result<()> {
             seed_radius_m,
             min_radius_m,
             max_cells,
+            max_runtime_secs,
             reset,
             reset_failed,
         } => {
@@ -212,6 +219,7 @@ async fn main() -> Result<()> {
                     max_cells,
                     reset,
                     reset_failed,
+                    max_runtime_secs,
                 },
             )
             .await
@@ -224,6 +232,7 @@ async fn main() -> Result<()> {
             auth_helper,
             browser_state,
             crawl_rate,
+            crawl_budget_secs,
         } => {
             refresh::run(
                 db,
@@ -235,6 +244,7 @@ async fn main() -> Result<()> {
                     auth_helper,
                     browser_state,
                     crawl_rate,
+                    crawl_budget_secs,
                 },
             )
             .await

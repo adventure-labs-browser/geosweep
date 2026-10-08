@@ -65,13 +65,15 @@ jobs:
           GC_PASS: ${{ secrets.GC_PASS }}
 
       - name: Refresh pass
-        # Stop cleanly before GitHub's six-hour job ceiling so the partial
-        # database can be validated and published as a resumable checkpoint.
-        # Rust owns auth for the entire crawl and handles SIGTERM gracefully.
+        # The crawler stops itself at 4h45 and cancels/requeues any in-flight
+        # search before returning success. The outer timeout is only a 5h15
+        # emergency fuse; it still leaves ~40 minutes before the job ceiling
+        # for validation, compression and release upload.
         run: |
-          timeout --preserve-status --signal=TERM --kill-after=2m 300m \
+          timeout --preserve-status --signal=TERM --kill-after=5m 315m \
             env -u GC_BEARER -u GC_JAR \
-            ./target/release/geosweep --db data/geosweep.db refresh
+            ./target/release/geosweep --db data/geosweep.db refresh \
+              --crawl-budget-secs 17100
         env:
           GC_AUTH_HELPER: .github/scripts/gc-login.py
           GC_BROWSER_STATE: gc-storage.json
@@ -96,20 +98,41 @@ jobs:
           ok = False
           try:
               assert os.path.getsize('data/geosweep.db') > 100_000
-              db = sqlite3.connect('file:data/geosweep.db?mode=ro', uri=True)
+              db = sqlite3.connect('data/geosweep.db', timeout=30)
+              db.execute('PRAGMA busy_timeout=30000')
               assert db.execute('PRAGMA page_count').fetchone()[0] > 0
               tables = {r[0] for r in db.execute(
                   "SELECT name FROM sqlite_master WHERE type='table'")}
               assert {'queue', 'caches', 'cache_versions', 'meta'}.issubset(tables)
+
+              # At this point the crawler process is gone. Any remaining
+              # in_progress row is an abandoned lease, not active work.
+              # next_skip already points at the next uncommitted page.
+              recovered = db.execute(
+                  "UPDATE queue SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                  "WHERE status='in_progress'").rowcount
+              db.commit()
+
+              # The release contains only geosweep.db, not -wal/-shm. Force
+              # every committed WAL page into the main file before compression.
+              busy, log, checkpointed = db.execute(
+                  'PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+              assert busy == 0, f'WAL checkpoint busy: log={log} checkpointed={checkpointed}'
+
               qfailed = db.execute("SELECT COUNT(*) FROM queue WHERE status='failed'").fetchone()[0]
               qpending = db.execute("SELECT COUNT(*) FROM queue WHERE status='pending'").fetchone()[0]
               qactive = db.execute("SELECT COUNT(*) FROM queue WHERE status='in_progress'").fetchone()[0]
               ncaches = db.execute('SELECT COUNT(*) FROM caches').fetchone()[0]
               assert qfailed <= 5, f'{qfailed} failed cells (a few bad cells are tolerated, a wave is not)'
-              assert qactive == 0, f'unclean checkpoint: {qactive} cells still in_progress'
+              assert qactive == 0, f'unclean checkpoint after lease recovery: {qactive} active'
               assert ncaches > 0, 'zero caches'
               complete = qpending == 0 and qfailed == 0
-              print(f'checkpoint: caches={ncaches} pending={qpending} failed={qfailed} complete={complete}', file=sys.stderr)
+              print(
+                  f'checkpoint: caches={ncaches} pending={qpending} failed={qfailed} '
+                  f'recovered_leases={recovered} complete={complete}',
+                  file=sys.stderr)
+              print(f'complete={str(complete).lower()}')
+              print(f'recovered_leases={recovered}')
               ok = True
           except Exception as e:
               print(f'validation failed: {e}', file=sys.stderr)
@@ -122,14 +145,26 @@ jobs:
           zstd -T0 data/geosweep.db -o /tmp/geosweep.db.zst
           ls -lh /tmp/geosweep.db.zst
           TAG="db-$(date -u +%F)"
-          gh release create "$TAG" /tmp/geosweep.db.zst \
-            --title "geosweep db $(date -u +%F)" \
-            --notes "Dated snapshot, kept 7 days." \
-            || true
-          gh release delete db-latest -y --cleanup-tag || true
-          gh release create db-latest /tmp/geosweep.db.zst \
-            --title "geosweep db $(date -u +%F)" \
-            --notes "Rolling database snapshot/checkpoint. Incomplete discovery is resumed next run without re-walking completed leaves."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" /tmp/geosweep.db.zst --clobber
+            gh release edit "$TAG" \
+              --title "geosweep db $(date -u +%F)" \
+              --notes "Dated snapshot/checkpoint, kept 7 days."
+          else
+            gh release create "$TAG" /tmp/geosweep.db.zst \
+              --title "geosweep db $(date -u +%F)" \
+              --notes "Dated snapshot/checkpoint, kept 7 days."
+          fi
+          if gh release view db-latest >/dev/null 2>&1; then
+            gh release upload db-latest /tmp/geosweep.db.zst --clobber
+            gh release edit db-latest \
+              --title "geosweep db $(date -u +%F)" \
+              --notes "Rolling database snapshot/checkpoint. Incomplete discovery resumes from saved page/cell checkpoints."
+          else
+            gh release create db-latest /tmp/geosweep.db.zst \
+              --title "geosweep db $(date -u +%F)" \
+              --notes "Rolling database snapshot/checkpoint. Incomplete discovery resumes from saved page/cell checkpoints."
+          fi
           gh release list --json tagName,createdAt \
             --jq '[.[] | select(.tagName | startswith("db-20")) | .tagName] | sort | .[:-7] | .[]' \
             | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
