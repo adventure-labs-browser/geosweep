@@ -170,6 +170,32 @@ impl Db {
         .context("db task join")?
     }
 
+    pub async fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_owned();
+        self.run(move |c| {
+            Ok(c.query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+    }
+
+    pub async fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.run(move |c| {
+            c.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     // ── crawl queue ─────────────────────────────────────────────────────
 
     pub async fn reset(&self) -> Result<()> {

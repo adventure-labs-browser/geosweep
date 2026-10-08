@@ -50,10 +50,20 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         )
         .await?,
     );
-    let client = Client::new(args.crawl_rate, auth)?;
-    crawl::run(
+    const RATE_KEY: &str = "adaptive_learned_rate_rps";
+    let learned_rate = db
+        .meta_get(RATE_KEY)
+        .await?
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+    if let Some(rate) = learned_rate {
+        info!("refresh: restoring learned API rate {rate:.3}/s from previous run");
+    }
+
+    let client = Client::with_learned_rate(args.crawl_rate, learned_rate, auth)?;
+    let crawl_result = crawl::run(
         db.clone(),
-        client,
+        client.clone(),
         crawl::Args {
             concurrency: 16,
             seeds: 16,
@@ -64,7 +74,12 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
             reset_failed: false,
         },
     )
-    .await?;
+    .await;
+
+    let learned_rate = client.learned_rate();
+    db.meta_set(RATE_KEY, &format!("{learned_rate:.6}")).await?;
+    info!("refresh: saved learned API rate {learned_rate:.3}/s for next run");
+    crawl_result?;
     let labs_after = db.labs_count().await?;
     info!(
         "refresh: +{} new caches this run ({labs_before} -> {labs_after})",
