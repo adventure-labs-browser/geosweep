@@ -105,12 +105,16 @@ jobs:
                   "SELECT name FROM sqlite_master WHERE type='table'")}
               assert {'queue', 'caches', 'cache_versions', 'meta'}.issubset(tables)
 
-              # At this point the crawler process is gone. Any remaining
-              # in_progress row is an abandoned lease, not active work.
-              # next_skip already points at the next uncommitted page.
+              # No cell is ever skipped from the next run. At this point
+              # the crawler is gone, so active leases are abandoned. Failed
+              # pages (including from older versions that exhausted 429s)
+              # must be retried too. next_skip survives both transitions.
               recovered = db.execute(
                   "UPDATE queue SET status='pending', updated_at=CURRENT_TIMESTAMP "
                   "WHERE status='in_progress'").rowcount
+              retried_failed = db.execute(
+                  "UPDATE queue SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                  "WHERE status='failed'").rowcount
               db.commit()
 
               # The release contains only geosweep.db, not -wal/-shm. Force
@@ -123,20 +127,23 @@ jobs:
               qpending = db.execute("SELECT COUNT(*) FROM queue WHERE status='pending'").fetchone()[0]
               qactive = db.execute("SELECT COUNT(*) FROM queue WHERE status='in_progress'").fetchone()[0]
               ncaches = db.execute('SELECT COUNT(*) FROM caches').fetchone()[0]
-              assert qfailed <= 5, f'{qfailed} failed cells (a few bad cells are tolerated, a wave is not)'
+              assert qfailed == 0, f'{qfailed} cells were not requeued'
               assert qactive == 0, f'unclean checkpoint after lease recovery: {qactive} active'
               assert ncaches > 0, 'zero caches'
               complete = qpending == 0 and qfailed == 0
               print(
                   f'checkpoint: caches={ncaches} pending={qpending} failed={qfailed} '
-                  f'recovered_leases={recovered} complete={complete}',
+                  f'recovered_leases={recovered} retried_failed={retried_failed} complete={complete}',
                   file=sys.stderr)
               print(f'complete={str(complete).lower()}')
               print(f'recovered_leases={recovered}')
+              print(f'retried_failed={retried_failed}')
               ok = True
           except Exception as e:
               print(f'validation failed: {e}', file=sys.stderr)
           print(f'valid={str(ok).lower()}')
+          if not ok:
+              sys.exit(1)
           PYEOF
 
       - name: Publish database to rolling release
