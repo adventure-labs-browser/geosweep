@@ -15,6 +15,7 @@ pub struct Args {
     pub auth_helper: String,
     pub browser_state: String,
     pub crawl_rate: f64,
+    pub crawl_budget_secs: u64,
 }
 
 pub async fn run(db: Db, args: Args) -> Result<()> {
@@ -72,6 +73,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
             max_cells: 0,
             reset: false,
             reset_failed: false,
+            max_runtime_secs: args.crawl_budget_secs,
         },
     )
     .await;

@@ -57,6 +57,8 @@ pub struct Args {
     pub max_cells: usize,
     pub reset: bool,
     pub reset_failed: bool,
+    /// Gracefully stop after this many seconds (0 = unlimited).
+    pub max_runtime_secs: u64,
 }
 
 pub async fn run(db: Db, client: Client, args: Args) -> Result<()> {
@@ -88,6 +90,17 @@ pub async fn run(db: Db, client: Client, args: Args) -> Result<()> {
 
     let client = Arc::new(client);
     let stop = crate::util::shutdown_flag();
+    let budget_task = if args.max_runtime_secs > 0 {
+        let stop = stop.clone();
+        let secs = args.max_runtime_secs;
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            warn!("crawl runtime budget reached ({secs}s): checkpointing cleanly");
+            stop.store(true, Ordering::SeqCst);
+        }))
+    } else {
+        None
+    };
     let processed = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(args.concurrency);
@@ -106,8 +119,15 @@ pub async fn run(db: Db, client: Client, args: Args) -> Result<()> {
     for h in handles {
         h.await??;
     }
+    if let Some(task) = budget_task {
+        task.abort();
+    }
     info!("done: {}", db.stats().await?);
-    verify_global(&db, &client).await;
+    if stop.load(Ordering::SeqCst) {
+        info!("checkpoint stop complete; skipping global verification until a complete crawl");
+    } else {
+        verify_global(&db, &client).await;
+    }
     Ok(())
 }
 
@@ -185,6 +205,35 @@ async fn claim_or_wait(
     }
 }
 
+async fn wait_until_stopped(stop: &Arc<std::sync::atomic::AtomicBool>) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Abort an in-flight HTTP/auth retry as soon as shutdown begins. Dropping the
+/// reqwest future cancels the request; the browser auth helper uses
+/// kill_on_drop, so workers do not need to wait through multi-minute retries.
+async fn search_interruptible(
+    client: &Client,
+    cell: &Cell,
+    take: usize,
+    skip: usize,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Option<crate::api::SearchResp>, ApiError> {
+    tokio::select! {
+        result = client.search(cell, take, skip) => result.map(Some),
+        _ = wait_until_stopped(stop) => Ok(None),
+    }
+}
+
+async fn release_for_checkpoint(db: &Db, cid: &str, skip: usize) {
+    match db.release_claim(cid.to_owned()).await {
+        Ok(()) => info!("[{cid}] released at skip={skip} — resumes here next run"),
+        Err(e) => error!("[{cid}] failed to release checkpoint claim: {e}"),
+    }
+}
+
 async fn process_cell(
     db: &Db,
     client: &Client,
@@ -199,8 +248,8 @@ async fn process_cell(
 
     if skip == 0 {
         // Fresh cell — page 0 decides whether we paginate or subdivide.
-        match client.search(cell, TAKE, 0).await {
-            Ok(first) => {
+        match search_interruptible(client, cell, TAKE, 0, stop).await {
+            Ok(Some(first)) => {
                 total = first.total_count;
                 if let Err(e) = db
                     .record_page(cid.clone(), TAKE as i64, Some(total as i64), first.items)
@@ -210,6 +259,10 @@ async fn process_cell(
                     return Ok(());
                 }
                 skip = TAKE;
+            }
+            Ok(None) => {
+                release_for_checkpoint(db, &cid, skip).await;
+                return Ok(());
             }
             Err(e) => {
                 if matches!(e, ApiError::Auth(_)) {
@@ -248,12 +301,11 @@ async fn process_cell(
     let normal = total as i64 <= PAGINATION_LIMIT;
     while skip <= MAX_SKIP && (!normal || (skip as u64) < total) {
         if stop.load(Ordering::SeqCst) {
-            let _ = db.release_claim(cid.clone()).await;
-            info!("[{cid}] released at skip={skip} — resumes here next run");
+            release_for_checkpoint(db, &cid, skip).await;
             return Ok(());
         }
-        match client.search(cell, TAKE, skip).await {
-            Ok(page) => {
+        match search_interruptible(client, cell, TAKE, skip, stop).await {
+            Ok(Some(page)) => {
                 let n = page.items.len();
                 if let Err(e) = db
                     .record_page(
@@ -270,6 +322,10 @@ async fn process_cell(
                 if n < TAKE {
                     break;
                 }
+            }
+            Ok(None) => {
+                release_for_checkpoint(db, &cid, skip).await;
+                return Ok(());
             }
             Err(e) => {
                 if matches!(e, ApiError::Auth(_)) {
@@ -298,7 +354,6 @@ async fn process_cell(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
