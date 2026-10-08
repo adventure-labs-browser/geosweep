@@ -70,7 +70,15 @@ pub struct SearchResp {
 }
 
 fn retriable(status: u16) -> bool {
-    status == 429 || (500..600).contains(&status)
+    (500..600).contains(&status)
+}
+
+/// Server throttling is not a failed page. Retry indefinitely with bounded
+/// exponential backoff when Retry-After is absent. The crawler's runtime
+/// budget cancels the request and releases its page checkpoint if necessary.
+fn throttle_delay(retry_after: Option<f64>, throttles: u32) -> Duration {
+    let backoff = BACKOFF.powi(throttles.min(10) as i32).max(1.0);
+    Duration::from_secs_f64(retry_after.unwrap_or(backoff).max(1.0))
 }
 
 fn snippet(s: &str, n: usize) -> String {
@@ -347,15 +355,20 @@ impl Client {
             "{SEARCH_URL}?box={lat_max},{lon_min},{lat_min},{lon_max}\
              &rad=16000&take={take}&skip={skip}&sort=distance&asc=true&app=geosweep"
         );
+        self.search_url(&url).await
+    }
+
+    async fn search_url(&self, url: &str) -> Result<SearchResp, ApiError> {
         let mut attempt: u32 = 0;
         let mut auth_failures: u32 = 0;
+        let mut throttles: u32 = 0;
 
         loop {
             self.acquire().await;
             let token = self.auth_token().await?;
             let resp = match self
                 .http
-                .get(&url)
+                .get(url)
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Accept", "application/json")
                 .send()
@@ -420,23 +433,39 @@ impl Client {
                 }
             }
 
+            if status == 429 {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0 && *v < 86_400.0);
+                // A 429 is a pause, NEVER an exhausted-retries failure. The
+                // same page stays claimed until it succeeds or the runtime
+                // budget cancels the request and returns it to pending.
+                // Only a real server Retry-After becomes a global floor.
+                self.note_limited(
+                    retry_after
+                        .map(Duration::from_secs_f64)
+                        .unwrap_or(Duration::ZERO),
+                );
+                throttles = throttles.saturating_add(1);
+                let delay = throttle_delay(retry_after, throttles);
+                if throttles == 1 || throttles.is_multiple_of(20) {
+                    warn!("HTTP 429: retrying same page after {delay:?} (429 #{throttles}; never marking failed)");
+                }
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
             if retriable(status) {
                 let retry_after = resp
                     .headers()
                     .get("retry-after")
                     .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<f64>().ok());
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0 && *v < 86_400.0);
                 let wait = retry_after.unwrap_or_else(|| BACKOFF.powi(attempt as i32));
-                if status == 429 {
-                    // Only a real server Retry-After becomes a global floor.
-                    // Our per-request exponential retry delay must not drag
-                    // every other worker down with it.
-                    self.note_limited(
-                        retry_after
-                            .map(Duration::from_secs_f64)
-                            .unwrap_or(Duration::ZERO),
-                    );
-                }
                 let message =
                     format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
                 attempt += 1;
@@ -510,6 +539,58 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttling_is_not_an_exhaustible_failure() {
+        assert!(!retriable(429));
+        assert!(retriable(500));
+        assert!(retriable(503));
+        for attempt in 1..=100 {
+            // Even after more than RETRIES 429s, no retry cap is involved.
+            let wait = throttle_delay(None, attempt);
+            assert!(wait >= Duration::from_secs(1));
+            assert!(wait <= Duration::from_secs(202));
+        }
+        assert_eq!(throttle_delay(Some(25.0), 999), Duration::from_secs(25));
+    }
+
+    #[tokio::test]
+    async fn eight_429s_then_200_preserves_the_same_page() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for n in 0..(RETRIES + 3) {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let bytes_read = socket.read(&mut request).unwrap();
+                assert!(bytes_read > 0);
+                let response = if n < RETRIES + 2 {
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+                } else {
+                    let body = r#"{"total":1,"results":[{"code":"GCTEST"}]}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let auth = Auth::resilient("", "", "", "test-token", "", "")
+            .await
+            .unwrap();
+        let client = Client::new(0.0, Arc::new(auth)).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), client.search_url(&url))
+            .await
+            .expect("429s should not stall beyond bounded Retry-After")
+            .expect("429 must never consume the normal retry limit");
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.items[0]["code"], "GCTEST");
+        server.join().unwrap();
+    }
 
     #[test]
     fn throttle_burst_only_changes_learned_rate_once() {
