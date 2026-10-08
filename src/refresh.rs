@@ -26,7 +26,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         // throw away most of the checkpointing benefit.
         let retried = db.reset_failed().await?;
         info!(
-            "refresh: resuming incomplete discovery — {} pending, {} in_progress,              {} failed re-queued; completed leaves stay done",
+            "refresh: resuming incomplete discovery — {} pending, {} in_progress, {} failed re-queued; completed leaves stay done",
             before.pending,
             before.in_progress,
             retried

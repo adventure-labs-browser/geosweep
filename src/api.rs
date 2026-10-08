@@ -118,10 +118,6 @@ const PROBE_FACTOR: f64 = 0.90;
 const CUT_FACTOR: f64 = 2.0;
 
 impl Adaptive {
-    fn new(rate: f64) -> Self {
-        Self::with_learned_rate(rate, None)
-    }
-
     fn with_learned_rate(rate: f64, learned_rate: Option<f64>) -> Self {
         let initial_rate = learned_rate
             .filter(|r| r.is_finite() && *r > 0.0)
@@ -425,14 +421,21 @@ impl Client {
             }
 
             if retriable(status) {
-                let wait = resp
+                let retry_after = resp
                     .headers()
                     .get("retry-after")
                     .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or_else(|| BACKOFF.powi(attempt as i32));
+                    .and_then(|s| s.parse::<f64>().ok());
+                let wait = retry_after.unwrap_or_else(|| BACKOFF.powi(attempt as i32));
                 if status == 429 {
-                    self.note_limited(Duration::from_secs_f64(wait));
+                    // Only a real server Retry-After becomes a global floor.
+                    // Our per-request exponential retry delay must not drag
+                    // every other worker down with it.
+                    self.note_limited(
+                        retry_after
+                            .map(Duration::from_secs_f64)
+                            .unwrap_or(Duration::ZERO),
+                    );
                 }
                 let message =
                     format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
@@ -510,21 +513,21 @@ mod tests {
 
     #[test]
     fn throttle_burst_only_changes_learned_rate_once() {
-        let mut a = Adaptive::new(10.0);
+        let mut a = Adaptive::with_learned_rate(10.0, None);
         let (first, _, learned_changed) = a.cut(Duration::ZERO);
         assert!(learned_changed);
         assert_eq!(first, Duration::from_millis(200));
-        assert_eq!(a.learned_rate(), 5.0);
+        assert!((a.learned_rate() - 5.0).abs() < 0.001);
 
         let (second, _, learned_changed) = a.cut(Duration::ZERO);
         assert!(!learned_changed);
         assert_eq!(second, first);
-        assert_eq!(a.learned_rate(), 5.0);
+        assert!((a.learned_rate() - 5.0).abs() < 0.001);
     }
 
     #[test]
     fn failed_probe_returns_to_last_good_rate() {
-        let mut a = Adaptive::new(1.0);
+        let mut a = Adaptive::with_learned_rate(1.0, None);
         for _ in 0..PROBE_SUCCESSES {
             a.success();
         }
@@ -535,12 +538,12 @@ mod tests {
         assert!(!learned_changed);
         assert!(!a.probing);
         assert_eq!(after, Duration::from_secs(1));
-        assert_eq!(a.learned_rate(), 1.0);
+        assert!((a.learned_rate() - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn clean_probe_becomes_new_learned_rate() {
-        let mut a = Adaptive::new(1.0);
+        let mut a = Adaptive::with_learned_rate(1.0, None);
         for _ in 0..PROBE_SUCCESSES {
             a.success();
         }
