@@ -92,37 +92,49 @@ pub fn cell_box(cell: &Cell) -> (f64, f64, f64, f64) {
     )
 }
 
-/// Adaptive rate limiter with fast recovery and burst-coalesced backoff.
+/// Adaptive limiter that learns a sustainable rate instead of oscillating.
 ///
-/// A single 429 burst can hit many concurrent workers. Treating every response
-/// as an independent signal used to multiply the interval all the way to 30s.
-/// We now cut at most once per short burst, honor Retry-After, and recover
-/// exponentially after a handful of clean requests.
+/// learned_interval is the long-lived rate we believe the server accepts.
+/// We spend almost all our time there. Occasionally, after a long clean run,
+/// we probe 10% faster. A failed probe immediately returns to the last known
+/// good rate; a 429 at the known-good rate makes that rate more conservative.
+/// Concurrent 429s are coalesced for 30s so one burst cannot cascade to 30s.
 struct Adaptive {
     interval: Duration,
-    base_interval: Duration,
+    learned_interval: Duration,
     clean: u64,
+    probing: bool,
     last_cut: Option<Instant>,
+    last_probe: Option<Instant>,
 }
 
 const MIN_INTERVAL: Duration = Duration::from_millis(50); // 20/s hard ceiling
 const MAX_INTERVAL: Duration = Duration::from_secs(30);
-const RECOVERY_SUCCESSES: u64 = 5;
-const GROWTH_SUCCESSES: u64 = 50;
-const CUT_COOLDOWN: Duration = Duration::from_secs(5);
+const CUT_COOLDOWN: Duration = Duration::from_secs(30);
+const PROBE_COOLDOWN: Duration = Duration::from_secs(120);
+const PROBE_SUCCESSES: u64 = 120;
+const TEMP_RECOVERY_SUCCESSES: u64 = 20;
+const PROBE_FACTOR: f64 = 0.90;
+const CUT_FACTOR: f64 = 2.0;
 
 impl Adaptive {
-    fn new(rate: f64) -> Self {
-        let interval = if rate > 0.0 {
-            Duration::from_secs_f64(1.0 / rate)
+    fn with_learned_rate(rate: f64, learned_rate: Option<f64>) -> Self {
+        let initial_rate = learned_rate
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .unwrap_or(rate);
+        let interval = if initial_rate > 0.0 {
+            Duration::from_secs_f64(1.0 / initial_rate)
+                .clamp(MIN_INTERVAL, MAX_INTERVAL)
         } else {
             Duration::ZERO
         };
         Self {
             interval,
-            base_interval: interval,
+            learned_interval: interval,
             clean: 0,
+            probing: false,
             last_cut: None,
+            last_probe: None,
         }
     }
 
@@ -130,51 +142,104 @@ impl Adaptive {
         self.interval
     }
 
-    /// Recover very quickly from throttle backoff, then cautiously probe
-    /// above the configured starting rate.
-    fn success(&mut self) -> Option<(Duration, Duration)> {
+    fn learned_rate(&self) -> f64 {
+        if self.learned_interval.is_zero() {
+            0.0
+        } else {
+            1.0 / self.learned_interval.as_secs_f64()
+        }
+    }
+
+    /// A clean request normally changes nothing. We only move after a long
+    /// stable streak: either shed a temporary Retry-After floor, validate a
+    /// probe, or begin a small 10% probe above the learned rate.
+    fn success(&mut self) -> Option<(&'static str, Duration, Duration)> {
         if self.interval.is_zero() {
             return None;
         }
         self.clean += 1;
         let old = self.interval;
-        if self.interval > self.base_interval && self.clean >= RECOVERY_SUCCESSES {
+
+        if self.interval > self.learned_interval && self.clean >= TEMP_RECOVERY_SUCCESSES {
             self.interval = self
                 .interval
                 .mul_f64(0.5)
-                .max(self.base_interval)
+                .max(self.learned_interval)
                 .max(MIN_INTERVAL);
             self.clean = 0;
-        } else if self.interval <= self.base_interval
-            && self.clean >= GROWTH_SUCCESSES
+            return (self.interval < old)
+                .then_some(("recovering temporary backoff", old, self.interval));
+        }
+
+        if self.probing && self.clean >= PROBE_SUCCESSES {
+            self.learned_interval = self.interval;
+            self.probing = false;
+            self.clean = 0;
+            self.last_probe = Some(Instant::now());
+            return Some(("accepted faster learned rate", old, self.interval));
+        }
+
+        if !self.probing
+            && self.interval == self.learned_interval
+            && self.clean >= PROBE_SUCCESSES
+            && self
+                .last_cut
+                .is_none_or(|t| t.elapsed() >= PROBE_COOLDOWN)
+            && self
+                .last_probe
+                .is_none_or(|t| t.elapsed() >= PROBE_COOLDOWN)
             && self.interval > MIN_INTERVAL
         {
-            self.interval = self.interval.mul_f64(0.9).max(MIN_INTERVAL);
+            self.interval = self.interval.mul_f64(PROBE_FACTOR).max(MIN_INTERVAL);
+            self.probing = true;
             self.clean = 0;
+            self.last_probe = Some(Instant::now());
+            return Some(("probing faster rate", old, self.interval));
         }
-        (self.interval < old).then_some((old, self.interval))
+
+        None
     }
 
-    /// Back off once per throttle burst instead of once per worker.
-    /// Retry-After is always honored even when the multiplicative cut is
-    /// coalesced with a recent one.
-    fn cut(&mut self, floor: Duration) -> (Duration, bool) {
+    /// Handle a 429. A failed probe falls straight back to the previous
+    /// learned-good rate. Otherwise, at most once per 30s, make the learned
+    /// rate more conservative. Retry-After can temporarily force us slower
+    /// without permanently poisoning the learned rate.
+    fn cut(&mut self, floor: Duration) -> (Duration, bool, bool) {
         let now = Instant::now();
-        let burst = self
+        let old = self.interval;
+        let mut learned_changed = false;
+
+        if self.probing {
+            self.interval = self.learned_interval.max(floor).min(MAX_INTERVAL);
+            self.probing = false;
+            self.clean = 0;
+            self.last_cut = Some(now);
+            return (self.interval, self.interval > old, false);
+        }
+
+        let in_burst = self
             .last_cut
             .is_some_and(|last| now.saturating_duration_since(last) < CUT_COOLDOWN);
-        let old = self.interval;
-        let candidate = if burst {
-            old.max(floor)
-        } else {
-            old.mul_f64(2.0).max(floor)
-        };
-        self.interval = candidate.min(MAX_INTERVAL);
-        self.clean = 0;
-        if !burst {
+
+        if !in_burst {
+            let candidate = self
+                .learned_interval
+                .mul_f64(CUT_FACTOR)
+                .max(floor)
+                .clamp(MIN_INTERVAL, MAX_INTERVAL);
+            if candidate > self.learned_interval {
+                self.learned_interval = candidate;
+                learned_changed = true;
+            }
             self.last_cut = Some(now);
         }
-        (self.interval, self.interval > old)
+
+        self.interval = self
+            .learned_interval
+            .max(floor)
+            .clamp(MIN_INTERVAL, MAX_INTERVAL);
+        self.clean = 0;
+        (self.interval, self.interval > old, learned_changed)
     }
 }
 #[derive(Clone)]
@@ -187,6 +252,14 @@ pub struct Client {
 
 impl Client {
     pub fn new(rate: f64, auth: Arc<Auth>) -> Result<Self> {
+        Self::with_learned_rate(rate, None, auth)
+    }
+
+    pub fn with_learned_rate(
+        rate: f64,
+        learned_rate: Option<f64>,
+        auth: Arc<Auth>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .user_agent(USER_AGENT)
@@ -195,8 +268,15 @@ impl Client {
             http,
             auth,
             next_slot: Arc::new(Mutex::new(Instant::now())),
-            adaptive: Arc::new(Mutex::new(Adaptive::new(rate))),
+            adaptive: Arc::new(Mutex::new(Adaptive::with_learned_rate(
+                rate,
+                learned_rate,
+            ))),
         })
+    }
+
+    pub fn learned_rate(&self) -> f64 {
+        self.adaptive.lock().unwrap().learned_rate()
     }
 
     async fn acquire(&self) {
@@ -216,28 +296,27 @@ impl Client {
         }
     }
 
-    /// Record a clean request and rapidly recover from prior throttling.
+    /// Record a clean request. Most successes deliberately do not change
+    /// the rate; that is what lets the limiter settle for long periods.
     fn note_success(&self) {
-        if let Some((old, new)) = self.adaptive.lock().unwrap().success() {
-            if old >= Duration::from_secs(1) || new >= Duration::from_secs(1) {
-                warn!(
-                    "rate limiter recovering: one request every {:.2}s -> {:.2}s",
-                    old.as_secs_f64(),
-                    new.as_secs_f64()
-                );
-            }
+        if let Some((what, old, new)) = self.adaptive.lock().unwrap().success() {
+            warn!(
+                "rate limiter {what}: {:.2}/s -> {:.2}/s",
+                1.0 / old.as_secs_f64(),
+                1.0 / new.as_secs_f64()
+            );
         }
     }
 
-    /// Record a 429. Concurrent responses from the same burst are coalesced,
-    /// and new acquisitions are held behind the resulting quiet period.
+    /// Record a 429 and hold all future acquisitions behind the new slot.
     fn note_limited(&self, retry_after: Duration) {
-        let (interval, changed) = self.adaptive.lock().unwrap().cut(retry_after);
-        if changed {
+        let (interval, changed, learned_changed) =
+            self.adaptive.lock().unwrap().cut(retry_after);
+        if changed || learned_changed {
             warn!(
-                "rate limiter backing off to {:.2}/s (one request every {:.2}s)",
+                "rate limiter 429: settling at {:.2}/s (learned {:.2}/s)",
                 1.0 / interval.as_secs_f64(),
-                interval.as_secs_f64()
+                self.learned_rate()
             );
         }
         let until = Instant::now() + interval.max(retry_after);
@@ -342,14 +421,21 @@ impl Client {
             }
 
             if retriable(status) {
-                let wait = resp
+                let retry_after = resp
                     .headers()
                     .get("retry-after")
                     .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or_else(|| BACKOFF.powi(attempt as i32));
+                    .and_then(|s| s.parse::<f64>().ok());
+                let wait = retry_after.unwrap_or_else(|| BACKOFF.powi(attempt as i32));
                 if status == 429 {
-                    self.note_limited(Duration::from_secs_f64(wait));
+                    // Only a real server Retry-After becomes a global floor.
+                    // Our per-request exponential retry delay must not drag
+                    // every other worker down with it.
+                    self.note_limited(
+                        retry_after
+                            .map(Duration::from_secs_f64)
+                            .unwrap_or(Duration::ZERO),
+                    );
                 }
                 let message =
                     format!("http {status}: {}", snippet(&resp.text().await.unwrap_or_default(), 200));
@@ -426,43 +512,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn throttle_burst_is_coalesced() {
-        let mut a = Adaptive::new(5.0);
-        let (first, changed) = a.cut(Duration::from_secs(1));
-        assert!(changed);
-        assert_eq!(first, Duration::from_secs(1));
+    fn throttle_burst_only_changes_learned_rate_once() {
+        let mut a = Adaptive::with_learned_rate(10.0, None);
+        let (first, _, learned_changed) = a.cut(Duration::ZERO);
+        assert!(learned_changed);
+        assert_eq!(first, Duration::from_millis(200));
+        assert!((a.learned_rate() - 5.0).abs() < 0.001);
 
-        let (second, changed) = a.cut(Duration::ZERO);
-        assert!(!changed);
+        let (second, _, learned_changed) = a.cut(Duration::ZERO);
+        assert!(!learned_changed);
         assert_eq!(second, first);
-
-        // A server-provided floor still wins inside the burst window.
-        let (third, changed) = a.cut(Duration::from_secs(3));
-        assert!(changed);
-        assert_eq!(third, Duration::from_secs(3));
+        assert!((a.learned_rate() - 5.0).abs() < 0.001);
     }
 
     #[test]
-    fn throttle_recovery_is_exponential() {
-        let mut a = Adaptive::new(5.0);
-        let (interval, _) = a.cut(Duration::from_secs(30));
-        assert_eq!(interval, Duration::from_secs(30));
-
-        for _ in 0..RECOVERY_SUCCESSES {
+    fn failed_probe_returns_to_last_good_rate() {
+        let mut a = Adaptive::with_learned_rate(1.0, None);
+        for _ in 0..PROBE_SUCCESSES {
             a.success();
         }
-        assert_eq!(a.current(), Duration::from_secs(15));
+        assert!(a.probing);
+        assert_eq!(a.current(), Duration::from_millis(900));
 
-        for _ in 0..RECOVERY_SUCCESSES {
+        let (after, _, learned_changed) = a.cut(Duration::ZERO);
+        assert!(!learned_changed);
+        assert!(!a.probing);
+        assert_eq!(after, Duration::from_secs(1));
+        assert!((a.learned_rate() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn clean_probe_becomes_new_learned_rate() {
+        let mut a = Adaptive::with_learned_rate(1.0, None);
+        for _ in 0..PROBE_SUCCESSES {
             a.success();
         }
-        assert_eq!(a.current(), Duration::from_millis(7500));
-
-        // A few more clean batches get back near the configured rate,
-        // rather than requiring millions of successes.
-        for _ in 0..(RECOVERY_SUCCESSES * 7) {
+        for _ in 0..PROBE_SUCCESSES {
             a.success();
         }
-        assert_eq!(a.current(), Duration::from_millis(200));
+        assert!(!a.probing);
+        assert!((a.learned_rate() - (1.0 / 0.9)).abs() < 0.001);
+    }
+
+    #[test]
+    fn persisted_rate_is_used_on_start() {
+        let a = Adaptive::with_learned_rate(10.0, Some(0.75));
+        assert!((a.learned_rate() - 0.75).abs() < 0.001);
+        assert_eq!(a.current(), a.learned_interval);
     }
 }
