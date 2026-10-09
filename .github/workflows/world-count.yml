@@ -19,12 +19,13 @@ jobs:
 
       - name: Install browser authentication runtime
         run: |
-          python3 -m pip install -q playwright
-          python3 -m playwright install chromium
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -q playwright
+          .venv/bin/python -m playwright install chromium
 
       - name: Count worldwide caches without crawling
         timeout-minutes: 5
-        run: python3 .github/scripts/world-count.py
+        run: .venv/bin/python .github/scripts/world-count.py
         env:
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
