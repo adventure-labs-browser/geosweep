@@ -262,7 +262,7 @@ async fn renew_resilient(sources: &mut ResilientSources) -> Result<(String, u64)
                         info!("auth recovered via direct form login");
                         return Ok((token, expires_in));
                     }
-                    Err(e) => warn!("direct form login succeeded but token mint failed: {e}"),
+                    Err(e) => warn!("direct form submission did not establish a bearer: {e}"),
                 },
                 Err(e) => warn!("direct form login failed: {e}"),
             }
@@ -272,7 +272,9 @@ async fn renew_resilient(sources: &mut ResilientSources) -> Result<(String, u64)
         // login dozens of times an hour will not fix an upstream outage and
         // may trigger additional account protection. Crawl-time cancellation
         // still interrupts this backoff without losing its page checkpoint.
-        let wait = (1u64 << cycle.min(9)).min(600);
+        // Repeated login attempts can worsen a site-side challenge or quota
+        // failure. Give the sign-in service at least a minute before retrying.
+        let wait = (60u64 * (1u64 << cycle.saturating_sub(1).min(4))).min(600);
         warn!("all auth sources failed in cycle {cycle}; retrying entire chain in {wait}s");
         tokio::time::sleep(Duration::from_secs(wait)).await;
     }

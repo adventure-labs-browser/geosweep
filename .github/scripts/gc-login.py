@@ -106,6 +106,21 @@ def dismiss_consent(page):
             pass
 
 
+def sign_in_blocker(page):
+    """Classify visible sign-in blockers without exposing input values."""
+    try:
+        body = page.locator("body").inner_text(timeout=3000).lower()
+    except Exception:
+        return None
+    if "exceeding recaptcha enterprise free quota" in body:
+        return "site reCAPTCHA Enterprise quota exceeded"
+    if "your password or username/email is incorrect" in body:
+        return "sign-in rejected the configured username or password"
+    if "captcha required" in body or "verify you are human" in body:
+        return "sign-in requires human verification"
+    return None
+
+
 def fresh_login(context, page, user, password):
     page.goto(SIGNIN, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(1500)
@@ -117,30 +132,37 @@ def fresh_login(context, page, user, password):
     user_field.fill(user)
     pass_field.fill(password)
 
-    # Enter is the least brittle primary submit path. If the page does not
-    # advance, try the first visible submit button as a fallback.
+    # Enter is the primary submit path. Only retry via a visible sign-in
+    # submit control if the browser is STILL on the login form: previously we
+    # might click unrelated controls on a legitimate alternate landing page.
     pass_field.press("Enter")
     try:
-        page.wait_for_url("**/play**", timeout=30000)
+        page.wait_for_url("**/play**", timeout=15000)
     except Exception:
-        for selector in ['button[type="submit"]', 'input[type="submit"]']:
+        if page.locator('input[name="Password"]:visible').count():
+            blocker = sign_in_blocker(page)
+            if blocker:
+                raise RuntimeError(blocker)
+            for selector in ['button[type="submit"]', 'input[type="submit"]']:
+                try:
+                    buttons = page.locator(selector)
+                    for i in range(buttons.count()):
+                        button = buttons.nth(i)
+                        if button.is_visible():
+                            button.click(timeout=5000)
+                            raise StopIteration
+                except StopIteration:
+                    break
+                except Exception:
+                    pass
             try:
-                buttons = page.locator(selector)
-                for i in range(buttons.count()):
-                    button = buttons.nth(i)
-                    if button.is_visible():
-                        button.click(timeout=5000)
-                        raise StopIteration
-            except StopIteration:
-                break
+                page.wait_for_url("**/play**", timeout=10000)
             except Exception:
+                # Some site variants land outside /play on success.
                 pass
-        try:
-            page.wait_for_url("**/play**", timeout=20000)
-        except Exception:
-            # The token endpoint is the authoritative login check. Some site
-            # variants do not land on /play even though authentication worked.
-            pass
+
+    if page.locator('input[name="Password"]:visible').count():
+        raise RuntimeError(sign_in_blocker(page) or "sign-in form remains visible after submission")
 
     return mint(context)
 
