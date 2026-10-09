@@ -12,25 +12,15 @@ concurrency:
 
 jobs:
   count:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
       - name: Install browser authentication runtime
         run: |
-          pip install -q playwright
-          python -m playwright install chromium --with-deps
-
-      - name: Read last published database
-        run: |
-          mkdir -p data
-          if gh release download db-latest -p 'geosweep.db.zst' --clobber; then
-            zstd -dc geosweep.db.zst -o data/geosweep.db
-            rm -f geosweep.db.zst
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
+          python3 -m pip install -q playwright
+          python3 -m playwright install chromium
 
       - name: Count worldwide caches without crawling
         timeout-minutes: 5
