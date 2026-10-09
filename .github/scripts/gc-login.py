@@ -60,7 +60,18 @@ def parse_token_response(resp):
     try:
         data = json.loads(body)
     except Exception as e:
-        raise RuntimeError(f"token endpoint returned non-JSON: {body[:160]!r}") from e
+        # Do not dump pages/cookies into Actions logs. A redirect to a sign-in
+        # or challenge page is a useful auth diagnostic, unlike HTML fragments.
+        import re
+        from urllib.parse import urlsplit
+
+        title = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+        title_text = re.sub(r"\s+", " ", title.group(1)).strip()[:100] if title else "(none)"
+        final_path = urlsplit(resp.url).path
+        raise RuntimeError(
+            f"token endpoint returned non-JSON: HTTP {status}, "
+            f"final_path={final_path!r}, html_title={title_text!r}"
+        ) from e
     access = data.get("access_token")
     if not isinstance(access, str) or access.count(".") != 2:
         raise RuntimeError("token endpoint response has no JWT access_token")

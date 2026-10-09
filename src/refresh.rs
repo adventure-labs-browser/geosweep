@@ -2,7 +2,8 @@
 //! caches. Discovery inserts are idempotent; field changes append to
 //! cache_versions. Every stage is resumable.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::time::Duration;
 use tracing::info;
 
 use crate::{api::Client, crawl, db::Db};
@@ -40,7 +41,11 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     // retries the complete chain instead of committing to whichever source
     // happened to work first.
     info!("refresh: using resilient authentication chain");
-    let auth = std::sync::Arc::new(
+    // This happens before crawl::run starts its own runtime deadline. If the
+    // OAuth endpoint is serving HTML instead of JWT JSON, an unbounded renewal
+    // loop here could consume the whole job without starting any discovery.
+    let auth = tokio::time::timeout(
+        Duration::from_secs(180),
         crate::auth::Auth::resilient(
             &args.auth_helper,
             &args.browser_state,
@@ -48,9 +53,11 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
             &args.bearer,
             &args.username,
             &args.password,
-        )
-        .await?,
-    );
+        ),
+    )
+    .await
+    .context("initial authentication unavailable for 180 seconds")??;
+    let auth = std::sync::Arc::new(auth);
     const RATE_KEY: &str = "adaptive_learned_rate_rps";
     let learned_rate = db
         .meta_get(RATE_KEY)
