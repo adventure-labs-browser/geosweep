@@ -69,6 +69,11 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     }
 
     let client = Client::with_learned_rate(args.crawl_rate, learned_rate, auth)?;
+    // Avoid publishing an unchanged checkpoint if initial OAuth fails.
+    if let Ok(marker) = std::env::var("GC_CRAWL_STARTED_MARKER") {
+        std::fs::write(&marker, "started\n")
+            .with_context(|| format!("write crawl-started marker {marker}"))?;
+    }
     let crawl_result = crawl::run(
         db.clone(),
         client.clone(),

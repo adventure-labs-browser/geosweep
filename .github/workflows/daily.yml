@@ -52,23 +52,6 @@ jobs:
             sleep "$wait"
           done
 
-      - name: Prove auth recovery paths
-        id: authcheck
-        timeout-minutes: 4
-        run: |
-          rm -f gc-storage.json
-          # A broken OAuth endpoint must not strand the entire six-hour job
-          # inside unlimited auth retries before crawling even begins.
-          # The Auth instance proves initial login and forced renewal.
-          timeout --signal=TERM --kill-after=10s 180s \
-            env -u GC_BEARER -u GC_JAR \
-            ./target/release/geosweep --db data/geosweep.db auth-browser
-        env:
-          GC_AUTH_HELPER: .github/scripts/gc-login.py
-          GC_BROWSER_STATE: gc-storage.json
-          GC_USER: ${{ secrets.GC_USER }}
-          GC_PASS: ${{ secrets.GC_PASS }}
-
       - name: Refresh pass
         id: refresh
         # The crawler stops itself at 4h45 and cancels/requeues any in-flight
@@ -76,6 +59,7 @@ jobs:
         # emergency fuse; it still leaves ~40 minutes before the job ceiling
         # for validation, compression and release upload.
         run: |
+          rm -f data/crawl-started
           timeout --preserve-status --signal=TERM --kill-after=5m 315m \
             env -u GC_BEARER -u GC_JAR \
             ./target/release/geosweep --db data/geosweep.db refresh \
@@ -83,6 +67,7 @@ jobs:
         env:
           GC_AUTH_HELPER: .github/scripts/gc-login.py
           GC_BROWSER_STATE: gc-storage.json
+          GC_CRAWL_STARTED_MARKER: data/crawl-started
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
 
@@ -137,6 +122,10 @@ jobs:
               assert qactive == 0, f'unclean checkpoint after lease recovery: {qactive} active'
               assert ncaches > 0, 'zero caches'
               complete = qpending == 0 and qfailed == 0
+              # Initial OAuth failure leaves the baseline restored unchanged.
+              # Don't disguise this by publishing that baseline a second time.
+              crawl_started = os.path.isfile('data/crawl-started')
+              print(f'crawl_started={str(crawl_started).lower()}')
               print(
                   f'checkpoint: caches={ncaches} pending={qpending} failed={qfailed} '
                   f'recovered_leases={recovered} retried_failed={retried_failed} complete={complete}',
@@ -153,10 +142,9 @@ jobs:
           PYEOF
 
       - name: Publish database to rolling release
-        # No publication when the auth preflight failed and the crawler was
-        # skipped. If a started refresh fails late, still publish its recovered
-        # checkpoint rather than discard valid progress.
-        if: always() && steps.dbcheck.outputs.valid == 'true' && steps.refresh.outcome != 'skipped'
+        # Skip publish when initial authentication never completed, but keep
+        # partial checkpoints from crawls that did start (including auth loss).
+        if: always() && steps.dbcheck.outputs.valid == 'true' && steps.dbcheck.outputs.crawl_started == 'true'
         run: |
           zstd -T0 data/geosweep.db -o /tmp/geosweep.db.zst
           ls -lh /tmp/geosweep.db.zst
