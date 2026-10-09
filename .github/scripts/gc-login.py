@@ -187,8 +187,27 @@ def run_once(state_path, user, password, screenshot):
             save_state(context, state_path)
             return access, expires_in, "fresh-login"
         except Exception:
+            # Report known sign-in blockers without logging form values,
+            # cookies or the response body.
             try:
-                page.screenshot(path=screenshot, full_page=False)
+                body_text = page.locator("body").inner_text(timeout=3000).lower()
+                if "exceeding recaptcha enterprise free quota" in body_text:
+                    log("AUTH SITE ISSUE: geocaching.com reCAPTCHA Enterprise quota exceeded")
+                if "your password or username/email is incorrect" in body_text:
+                    log("AUTH LOGIN REJECTED: sign-in form reports incorrect credentials")
+            except Exception:
+                pass
+            try:
+                # Artifacts from public repositories must not expose user/email
+                # fields, even when debugging a failed login.
+                page.screenshot(
+                    path=screenshot,
+                    full_page=False,
+                    mask=[
+                        page.locator('input[name="UsernameOrEmail"]'),
+                        page.locator('input[name="Password"]'),
+                    ],
+                )
             except Exception:
                 pass
             raise
