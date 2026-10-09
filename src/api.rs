@@ -120,10 +120,12 @@ const MIN_INTERVAL: Duration = Duration::from_millis(50); // 20/s hard ceiling
 const MAX_INTERVAL: Duration = Duration::from_secs(30);
 const CUT_COOLDOWN: Duration = Duration::from_secs(30);
 const PROBE_COOLDOWN: Duration = Duration::from_secs(120);
-const PROBE_SUCCESSES: u64 = 120;
+// Shorter clean streaks speed up cautious recovery from old throttle events.
+const PROBE_SUCCESSES: u64 = 40;
 const TEMP_RECOVERY_SUCCESSES: u64 = 20;
 const PROBE_FACTOR: f64 = 0.90;
-const CUT_FACTOR: f64 = 2.0;
+// A lone 429 should not erase hours of proven successful throughput.
+const CUT_FACTOR: f64 = 1.5;
 
 impl Adaptive {
     fn with_learned_rate(rate: f64, learned_rate: Option<f64>) -> Self {
@@ -233,7 +235,6 @@ impl Adaptive {
             let candidate = self
                 .learned_interval
                 .mul_f64(CUT_FACTOR)
-                .max(floor)
                 .clamp(MIN_INTERVAL, MAX_INTERVAL);
             if candidate > self.learned_interval {
                 self.learned_interval = candidate;
@@ -309,7 +310,7 @@ impl Client {
     fn note_success(&self) {
         if let Some((what, old, new)) = self.adaptive.lock().unwrap().success() {
             warn!(
-                "rate limiter {what}: {:.2}/s -> {:.2}/s",
+                "rate limiter {what}: {:.3}/s -> {:.3}/s",
                 1.0 / old.as_secs_f64(),
                 1.0 / new.as_secs_f64()
             );
@@ -322,7 +323,7 @@ impl Client {
             self.adaptive.lock().unwrap().cut(retry_after);
         if changed || learned_changed {
             warn!(
-                "rate limiter 429: settling at {:.2}/s (learned {:.2}/s)",
+                "rate limiter 429: settling at {:.3}/s (learned {:.3}/s)",
                 1.0 / interval.as_secs_f64(),
                 self.learned_rate()
             );
@@ -597,13 +598,27 @@ mod tests {
         let mut a = Adaptive::with_learned_rate(10.0, None);
         let (first, _, learned_changed) = a.cut(Duration::ZERO);
         assert!(learned_changed);
-        assert_eq!(first, Duration::from_millis(200));
-        assert!((a.learned_rate() - 5.0).abs() < 0.001);
+        assert_eq!(first, Duration::from_millis(150));
+        assert!((a.learned_rate() - (10.0 / 1.5)).abs() < 0.001);
 
         let (second, _, learned_changed) = a.cut(Duration::ZERO);
         assert!(!learned_changed);
         assert_eq!(second, first);
-        assert!((a.learned_rate() - 5.0).abs() < 0.001);
+        assert!((a.learned_rate() - (10.0 / 1.5)).abs() < 0.001);
+    }
+
+    #[test]
+    fn retry_after_is_temporary_not_the_new_learned_rate() {
+        let mut a = Adaptive::with_learned_rate(1.0, None);
+        let (interval, _, learned_changed) = a.cut(Duration::from_secs(15));
+        assert!(learned_changed);
+        assert_eq!(interval, Duration::from_secs(15));
+        assert_eq!(a.learned_interval, Duration::from_millis(1500));
+        for _ in 0..TEMP_RECOVERY_SUCCESSES {
+            a.success();
+        }
+        assert_eq!(a.current(), Duration::from_millis(7500));
+        assert_eq!(a.learned_interval, Duration::from_millis(1500));
     }
 
     #[test]
