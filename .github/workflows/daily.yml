@@ -53,11 +53,16 @@ jobs:
           done
 
       - name: Prove auth recovery paths
+        id: authcheck
+        timeout-minutes: 4
         run: |
           rm -f gc-storage.json
-          # This uses one Auth instance: first call must establish auth, then
-          # force_refresh exercises the exact expiry/401 renewal path immediately.
-          env -u GC_BEARER -u GC_JAR ./target/release/geosweep --db data/geosweep.db auth-browser
+          # A broken OAuth endpoint must not strand the entire six-hour job
+          # inside unlimited auth retries before crawling even begins.
+          # The Auth instance proves initial login and forced renewal.
+          timeout --signal=TERM --kill-after=10s 180s \
+            env -u GC_BEARER -u GC_JAR \
+            ./target/release/geosweep --db data/geosweep.db auth-browser
         env:
           GC_AUTH_HELPER: .github/scripts/gc-login.py
           GC_BROWSER_STATE: gc-storage.json
@@ -65,6 +70,7 @@ jobs:
           GC_PASS: ${{ secrets.GC_PASS }}
 
       - name: Refresh pass
+        id: refresh
         # The crawler stops itself at 4h45 and cancels/requeues any in-flight
         # search before returning success. The outer timeout is only a 5h15
         # emergency fuse; it still leaves ~40 minutes before the job ceiling
@@ -147,7 +153,10 @@ jobs:
           PYEOF
 
       - name: Publish database to rolling release
-        if: always() && steps.dbcheck.outputs.valid == 'true'
+        # No publication when the auth preflight failed and the crawler was
+        # skipped. If a started refresh fails late, still publish its recovered
+        # checkpoint rather than discard valid progress.
+        if: always() && steps.dbcheck.outputs.valid == 'true' && steps.refresh.outcome != 'skipped'
         run: |
           zstd -T0 data/geosweep.db -o /tmp/geosweep.db.zst
           ls -lh /tmp/geosweep.db.zst

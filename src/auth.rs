@@ -268,7 +268,11 @@ async fn renew_resilient(sources: &mut ResilientSources) -> Result<(String, u64)
             }
         }
 
-        let wait = (1u64 << cycle.min(5)).min(60);
+        // When every credential source fails, ease off: repeatedly attempting
+        // login dozens of times an hour will not fix an upstream outage and
+        // may trigger additional account protection. Crawl-time cancellation
+        // still interrupts this backoff without losing its page checkpoint.
+        let wait = (1u64 << cycle.min(9)).min(600);
         warn!("all auth sources failed in cycle {cycle}; retrying entire chain in {wait}s");
         tokio::time::sleep(Duration::from_secs(wait)).await;
     }
