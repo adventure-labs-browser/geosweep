@@ -531,7 +531,13 @@ impl Client {
                 .json()
                 .await
                 .map_err(|e| ApiError::Retries(format!("json: {e}")))?;
-            return Ok(v.get("total").and_then(|t| t.as_u64()).unwrap_or(0));
+            return v
+                .get("total")
+                .and_then(|t| t.as_u64())
+                .filter(|total| *total > 0)
+                .ok_or_else(|| {
+                    ApiError::Retries("global search response missing positive total".to_owned())
+                });
         }
     }
 }

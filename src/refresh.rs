@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{api::Client, crawl, db::Db};
 
@@ -69,6 +69,19 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     }
 
     let client = Client::with_learned_rate(args.crawl_rate, learned_rate, auth)?;
+    // Like LabSweep, obtain the entire searchable population from one
+    // planet-sized query with take=1. Do this right after our existing login,
+    // before the long-running crawl, so discovery need not finish for a count.
+    // Count checks must never block or invalidate an otherwise healthy crawl.
+    match tokio::time::timeout(Duration::from_secs(45), client.global_total()).await {
+        Ok(Ok(total)) if total > 0 => {
+            db.meta_set("worldwide_search_total", &total.to_string()).await?;
+            info!("refresh: worldwide searchable geocaches = {total}");
+        }
+        Ok(Ok(_)) => warn!("refresh: worldwide search returned zero; ignoring suspect count"),
+        Ok(Err(err)) => warn!("refresh: worldwide search count unavailable: {err}"),
+        Err(_) => warn!("refresh: worldwide search count timed out; continuing crawl"),
+    }
     // Avoid publishing an unchanged checkpoint if initial OAuth fails.
     if let Ok(marker) = std::env::var("GC_CRAWL_STARTED_MARKER") {
         std::fs::write(&marker, "started\n")
