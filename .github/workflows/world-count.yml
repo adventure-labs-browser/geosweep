@@ -1,0 +1,40 @@
+name: world cache count
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: geosweep-world-count
+  cancel-in-progress: false
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install browser authentication runtime
+        run: |
+          pip install -q playwright
+          python -m playwright install chromium --with-deps
+
+      - name: Read last published database
+        run: |
+          mkdir -p data
+          if gh release download db-latest -p 'geosweep.db.zst' --clobber; then
+            zstd -dc geosweep.db.zst -o data/geosweep.db
+            rm -f geosweep.db.zst
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Count worldwide caches without crawling
+        timeout-minutes: 5
+        run: python3 .github/scripts/world-count.py
+        env:
+          GC_USER: ${{ secrets.GC_USER }}
+          GC_PASS: ${{ secrets.GC_PASS }}
