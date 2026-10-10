@@ -2,6 +2,11 @@ name: world cache count
 
 on:
   workflow_dispatch:
+    inputs:
+      probe_oracle:
+        description: "Run short authenticated Oracle-IP rate probe instead of worldwide count"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -12,6 +17,7 @@ concurrency:
 
 jobs:
   count:
+    if: ${{ !inputs.probe_oracle }}
     runs-on: macos-15
     timeout-minutes: 12
     steps:
@@ -26,6 +32,24 @@ jobs:
       - name: Count worldwide caches without crawling
         timeout-minutes: 5
         run: .venv/bin/python .github/scripts/world-count.py
+        env:
+          GC_USER: ${{ secrets.GC_USER }}
+          GC_PASS: ${{ secrets.GC_PASS }}
+
+  oracle-probe:
+    if: ${{ inputs.probe_oracle }}
+    runs-on: [self-hosted, Linux, ARM64, geosweep-oracle-probe]
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated browser authentication dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -q playwright
+          .venv/bin/python -m playwright install --with-deps chromium
+      - name: Measure Oracle IP throttling with bounded search requests
+        timeout-minutes: 10
+        run: .venv/bin/python -u .github/scripts/oracle-rate-probe.py
         env:
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
