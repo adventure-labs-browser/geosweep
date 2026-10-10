@@ -1,0 +1,52 @@
+name: request soft stop
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Daily workflow run ID to stop after saving its checkpoint"
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate running daily job and create stop marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          if [[ ! "$TARGET_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::run_id must be numeric"
+            exit 1
+          fi
+          info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$TARGET_RUN_ID")
+          kind=$(jq -r .name <<< "$info")
+          status=$(jq -r .status <<< "$info")
+          sha=$(jq -r .head_sha <<< "$info")
+          if [[ "$kind" != "daily" || "$status" != "in_progress" ]]; then
+            echo "::error::Run $TARGET_RUN_ID is not an in-progress daily run"
+            exit 1
+          fi
+
+          # Never silently accept a stop request for old runs like #29:
+          # their pinned workflow doesn't contain the control watcher.
+          if ! gh api --method GET             "repos/$GITHUB_REPOSITORY/contents/.github/scripts/controlled-refresh.py?ref=$sha"             --silent > /dev/null 2>&1; then
+            echo "::error::Run $TARGET_RUN_ID predates soft-stop support; no remote soft-stop possible"
+            exit 1
+          fi
+
+          ref="refs/heads/geosweep-stop-$TARGET_RUN_ID"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/geosweep-stop-$TARGET_RUN_ID"                --silent >/dev/null 2>&1; then
+            echo "Stop already requested for run $TARGET_RUN_ID"
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"               -f ref="$ref" -f sha="$sha" --silent
+            echo "Soft stop requested for run $TARGET_RUN_ID"
+          fi
+          echo "The crawler checks within about 20s, exits gracefully, validates SQLite and publishes db-latest."
+          echo "Do not press GitHub's Cancel workflow button."
