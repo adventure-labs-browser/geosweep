@@ -8,6 +8,16 @@ use tracing::{info, warn};
 
 use crate::{api::Client, crawl, db::Db};
 
+/// Keep residential rate learning separate from datacenter rate learning.
+/// The original key remains the hosted default for backward compatibility.
+fn rate_meta_key(scope: &str) -> &'static str {
+    if scope == "local" {
+        "adaptive_learned_rate_rps_local"
+    } else {
+        "adaptive_learned_rate_rps"
+    }
+}
+
 pub struct Args {
     pub username: String,
     pub password: String,
@@ -58,9 +68,11 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     .await
     .context("initial authentication unavailable for 180 seconds")??;
     let auth = std::sync::Arc::new(auth);
-    const RATE_KEY: &str = "adaptive_learned_rate_rps";
+    let rate_scope = std::env::var("GC_RATE_SCOPE").unwrap_or_else(|_| "hosted".to_owned());
+    let rate_key = rate_meta_key(&rate_scope);
+    info!("refresh: API rate scope={rate_scope}");
     let learned_rate = db
-        .meta_get(RATE_KEY)
+        .meta_get(rate_key)
         .await?
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0);
@@ -104,7 +116,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     .await;
 
     let learned_rate = client.learned_rate();
-    db.meta_set(RATE_KEY, &format!("{learned_rate:.6}")).await?;
+    db.meta_set(rate_key, &format!("{learned_rate:.6}")).await?;
     info!("refresh: saved learned API rate {learned_rate:.3}/s for next run");
     crawl_result?;
     let labs_after = db.labs_count().await?;
@@ -114,4 +126,17 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     );
     info!("refresh: done — {}", db.stats().await?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rate_meta_key;
+
+    #[test]
+    fn local_and_hosted_rates_are_independent() {
+        assert_eq!(rate_meta_key("hosted"), "adaptive_learned_rate_rps");
+        assert_eq!(rate_meta_key(""), "adaptive_learned_rate_rps");
+        assert_eq!(rate_meta_key("local"), "adaptive_learned_rate_rps_local");
+        assert_ne!(rate_meta_key("local"), rate_meta_key("hosted"));
+    }
 }
