@@ -34,3 +34,8 @@ cargo run --release -- --db data/geosweep.db verify
 
 Automation: private repo + daily GitHub Action, DB in a rolling
 `db-latest` release (+ 7 dated backups).
+
+To test running that **same** job from a residential IP on an Apple Silicon
+Mac, see [self-hosted Mac setup](docs/local-runner.md). The default scheduled
+runner remains GitHub-hosted until deliberately changed. Both targets share
+the same Actions concurrency lock and resumable checkpoint.

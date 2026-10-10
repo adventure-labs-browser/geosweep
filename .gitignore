@@ -2,3 +2,7 @@ target/
 data/
 *.db
 *.log
+.venv/
+gc-storage.json
+gc-*-state.json
+gc-login-fail.png
