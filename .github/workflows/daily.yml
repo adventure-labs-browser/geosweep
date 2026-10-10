@@ -108,19 +108,12 @@ jobs:
             echo "::error::crawl_minutes must be 1..285"; exit 1
           fi
           budget_secs=$((GC_CRAWL_MINUTES * 60))
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            deadline_cmd=gtimeout
-          else
-            deadline_cmd=timeout
-          fi
-          "$deadline_cmd" --preserve-status --signal=TERM --kill-after=5m 315m \
-            env -u GC_BEARER -u GC_JAR \
-            ./target/release/geosweep --db data/geosweep.db refresh \
-              --crawl-rate "$GC_START_RATE" --crawl-budget-secs "$budget_secs"
+          python3 -u .github/scripts/controlled-refresh.py "$budget_secs" "$GC_START_RATE"
         env:
           GC_AUTH_HELPER: .github/scripts/gc-login.py
           GC_BROWSER_STATE: gc-storage.json
           GC_CRAWL_STARTED_MARKER: data/crawl-started
+          GH_TOKEN: ${{ github.token }}
           GC_USER: ${{ secrets.GC_USER }}
           GC_PASS: ${{ secrets.GC_PASS }}
 
@@ -225,5 +218,14 @@ jobs:
           gh release list --json tagName,createdAt \
             --jq '[.[] | select(.tagName | startswith("db-20")) | .tagName] | sort | .[:-7] | .[]' \
             | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Remove this run's soft-stop marker
+        if: always()
+        run: |
+          gh api --method DELETE \
+            "repos/$GITHUB_REPOSITORY/git/refs/heads/geosweep-stop-$GITHUB_RUN_ID" \
+            --silent >/dev/null 2>&1 || true
         env:
           GH_TOKEN: ${{ github.token }}

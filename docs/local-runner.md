@@ -77,6 +77,30 @@ and publishing, not a separate archive. Omit the minutes option for a normal
 added per hour** against a GitHub-hosted run. One successful 1/s burst
 is not proof of sustained performance.
 
+## Request a soft stop (supported future runs only)
+
+To stop an active daily run **without discarding its new discoveries**, use
+GitHub Actions → **request soft stop** → Run workflow, and enter its numeric
+run ID. Alternatively, from **fish**:
+
+```fish
+gh workflow run soft-stop.yml --repo adventure-labs-browser/geosweep --ref main -f run_id=YOUR_RUN_ID
+```
+
+The soft-stop request creates a Git ref specific to that run. The in-job
+controller polls roughly every 20 seconds, sends SIGTERM to the bounded
+crawler, lets Rust release in-flight page claims, and then runs the existing
+SQLite validation and publication steps normally. Its request workflow
+explicitly rejects old runs that predate the controller (including #29).
+Don't use the ordinary GitHub **Cancel workflow** button for this: it can
+kill the runner before the checkpoint is published. If the control request
+fails, **do not assume** the crawl has stopped; check the run logs for
+`SOFT STOP COMPLETE` and the publication step for a successful release.
+
+After stop and publication the run-specific marker is removed. The marker
+is a lightweight temporary Git branch; it is not a database checkpoint and
+doesn't cause a second crawling job.
+
 If residential throughput is reliably higher, switch the *scheduled*
 job to the Mac:
 
