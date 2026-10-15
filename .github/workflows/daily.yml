@@ -54,10 +54,9 @@ jobs:
 
       - name: Refresh pass
         id: refresh
-        # The crawler stops itself at 4h45 and cancels/requeues any in-flight
-        # search before returning success. The outer timeout is only a 5h15
-        # emergency fuse; it still leaves ~40 minutes before the job ceiling
-        # for validation, compression and release upload.
+        # Login retries and discovery share the 4h45 pass budget. Extended
+        # initial authentication cannot starve the checkpoint/publish phase.
+        # The 5h15 external timeout remains an emergency fuse.
         run: |
           rm -f data/crawl-started
           timeout --preserve-status --signal=TERM --kill-after=5m 315m \
@@ -66,6 +65,7 @@ jobs:
               --crawl-budget-secs 17100
         env:
           GC_AUTH_HELPER: .github/scripts/gc-login.py
+          GC_INITIAL_AUTH_TIMEOUT_SECS: "2700"
           GC_BROWSER_STATE: gc-storage.json
           GC_CRAWL_STARTED_MARKER: data/crawl-started
           GC_USER: ${{ secrets.GC_USER }}

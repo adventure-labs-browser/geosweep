@@ -3,7 +3,7 @@
 //! cache_versions. Every stage is resumable.
 
 use anyhow::{Context, Result};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::{api::Client, crawl, db::Db};
@@ -20,6 +20,8 @@ pub struct Args {
 }
 
 pub async fn run(db: Db, args: Args) -> Result<()> {
+    // Login retries must be accounted for in the overall refresh time budget.
+    let pass_started = Instant::now();
     let labs_before = db.labs_count().await?;
     let before = db.stats().await?;
     if before.pending > 0 || before.in_progress > 0 || before.failed > 0 {
@@ -41,11 +43,16 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     // retries the complete chain instead of committing to whichever source
     // happened to work first.
     info!("refresh: using resilient authentication chain");
-    // This happens before crawl::run starts its own runtime deadline. If the
-    // OAuth endpoint is serving HTML instead of JWT JSON, an unbounded renewal
-    // loop here could consume the whole job without starting any discovery.
+    // Intermittent site-side sign-in rejection needs more than two backoff
+    // cycles, but a hard deadline still protects the checkpoint/publish window.
+    let auth_timeout_secs = std::env::var("GC_INITIAL_AUTH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(2700);
+    info!("refresh: initial authentication retry window {auth_timeout_secs}s");
     let auth = tokio::time::timeout(
-        Duration::from_secs(180),
+        Duration::from_secs(auth_timeout_secs),
         crate::auth::Auth::resilient(
             &args.auth_helper,
             &args.browser_state,
@@ -56,7 +63,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         ),
     )
     .await
-    .context("initial authentication unavailable for 180 seconds")??;
+    .with_context(|| format!("initial authentication unavailable for {auth_timeout_secs} seconds"))??;
     let auth = std::sync::Arc::new(auth);
     const RATE_KEY: &str = "adaptive_learned_rate_rps";
     let learned_rate = db
@@ -87,6 +94,10 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         std::fs::write(&marker, "started\n")
             .with_context(|| format!("write crawl-started marker {marker}"))?;
     }
+    let remaining_budget = remaining_crawl_budget(args.crawl_budget_secs, pass_started.elapsed());
+    if args.crawl_budget_secs > 0 {
+        info!("refresh: {remaining_budget}s of overall pass budget remain for discovery");
+    }
     let crawl_result = crawl::run(
         db.clone(),
         client.clone(),
@@ -98,7 +109,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
             max_cells: 0,
             reset: false,
             reset_failed: false,
-            max_runtime_secs: args.crawl_budget_secs,
+            max_runtime_secs: remaining_budget,
         },
     )
     .await;
@@ -114,4 +125,32 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     );
     info!("refresh: done — {}", db.stats().await?);
     Ok(())
+}
+
+/// Include authentication delay in the budget so temporary upstream sign-in
+/// failures do not cause the GitHub Actions hard timeout to discard progress.
+fn remaining_crawl_budget(configured: u64, elapsed: Duration) -> u64 {
+    if configured == 0 {
+        0
+    } else {
+        configured.saturating_sub(elapsed.as_secs()).max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remaining_crawl_budget;
+    use std::time::Duration;
+
+    #[test]
+    fn auth_delay_reduces_discovery_budget() {
+        assert_eq!(remaining_crawl_budget(17_100, Duration::from_secs(2_700)), 14_400);
+        assert_eq!(remaining_crawl_budget(17_100, Duration::ZERO), 17_100);
+    }
+
+    #[test]
+    fn unlimited_and_exhausted_budgets() {
+        assert_eq!(remaining_crawl_budget(0, Duration::from_secs(30_000)), 0);
+        assert_eq!(remaining_crawl_budget(100, Duration::from_secs(150)), 1);
+    }
 }
