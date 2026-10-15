@@ -227,6 +227,7 @@ async fn renew_resilient(sources: &mut ResilientSources) -> Result<(String, u64)
 
     loop {
         cycle += 1;
+        let mut browser_signin_rejected = false;
 
         if let Some((helper, state_path)) = &sources.helper {
             match browser_mint_once(helper, state_path).await {
@@ -234,7 +235,13 @@ async fn renew_resilient(sources: &mut ResilientSources) -> Result<(String, u64)
                     info!("auth recovered via browser/{source}; token lifetime {expires_in}s");
                     return Ok((token, expires_in));
                 }
-                Err(e) => warn!("browser auth failed: {e}; trying fallback sources"),
+                Err(e) => {
+                    // A raw HTTP POST cannot complete browser verification and
+                    // repeated submissions can worsen a temporary lockout.
+                    browser_signin_rejected = e.to_string().contains("AUTH LOGIN REJECTED")
+                        || e.to_string().contains("AUTH SITE ISSUE");
+                    warn!("browser auth failed: {e}; trying fallback sources");
+                }
             }
         }
 
@@ -256,15 +263,19 @@ async fn renew_resilient(sources: &mut ResilientSources) -> Result<(String, u64)
         }
 
         if let Some(http) = &sources.form_http {
-            match form_login(http, &sources.username, &sources.password).await {
-                Ok(()) => match mint(http).await {
-                    Ok((token, expires_in)) => {
-                        info!("auth recovered via direct form login");
-                        return Ok((token, expires_in));
-                    }
-                    Err(e) => warn!("direct form submission did not establish a bearer: {e}"),
-                },
-                Err(e) => warn!("direct form login failed: {e}"),
+            if browser_signin_rejected {
+                warn!("site rejected browser sign-in; skipping redundant direct POST until next retry");
+            } else {
+                match form_login(http, &sources.username, &sources.password).await {
+                    Ok(()) => match mint(http).await {
+                        Ok((token, expires_in)) => {
+                            info!("auth recovered via direct form login");
+                            return Ok((token, expires_in));
+                        }
+                        Err(e) => warn!("direct form submission did not establish a bearer: {e}"),
+                    },
+                    Err(e) => warn!("direct form login failed: {e}"),
+                }
             }
         }
 
@@ -394,9 +405,20 @@ async fn form_login(
         .await
         .context("login post")?;
     let login_status = login_resp.status();
-    let _ = login_resp.text().await.unwrap_or_default();
+    let returned_to_signin = login_resp.url().path().starts_with("/account/signin");
+    let response_body = login_resp.text().await.unwrap_or_default();
     if !login_status.is_success() {
         anyhow::bail!("login post http {login_status}");
+    }
+    // A rejected login can return an HTTP 200 containing the same form.
+    if response_body
+        .to_ascii_lowercase()
+        .contains("your password or username/email is incorrect")
+    {
+        anyhow::bail!("site rejected login (credentials or verification challenge)");
+    }
+    if returned_to_signin {
+        anyhow::bail!("login returned to sign-in page without a session");
     }
 
     Ok(())
@@ -405,6 +427,7 @@ async fn form_login(
 async fn mint(http: &reqwest::Client) -> Result<(String, u64)> {
     let tok_resp = http.get(TOKEN_URL).send().await.context("oauth token fetch")?;
     let tok_status = tok_resp.status();
+    let tok_path = tok_resp.url().path().to_owned();
     let tok_body = tok_resp.text().await.unwrap_or_default();
     if !tok_status.is_success() {
         anyhow::bail!(
@@ -413,8 +436,8 @@ async fn mint(http: &reqwest::Client) -> Result<(String, u64)> {
         );
     }
 
-    let tok: serde_json::Value =
-        serde_json::from_str(&tok_body).context("oauth token json")?;
+    let tok: serde_json::Value = serde_json::from_str(&tok_body)
+        .with_context(|| format!("oauth token returned non-JSON (HTTP {tok_status}, final_path={tok_path})"))?;
     let access = tok
         .get("access_token")
         .and_then(|t| t.as_str())

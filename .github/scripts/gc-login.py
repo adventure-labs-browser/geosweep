@@ -115,7 +115,7 @@ def sign_in_blocker(page):
     if "exceeding recaptcha enterprise free quota" in body:
         return "site reCAPTCHA Enterprise quota exceeded"
     if "your password or username/email is incorrect" in body:
-        return "sign-in rejected the configured username or password"
+        return "site rejected sign-in (credentials or verification challenge)"
     if "captcha required" in body or "verify you are human" in body:
         return "sign-in requires human verification"
     return None
@@ -132,34 +132,27 @@ def fresh_login(context, page, user, password):
     user_field.fill(user)
     pass_field.fill(password)
 
-    # Enter is the primary submit path. Only retry via a visible sign-in
-    # submit control if the browser is STILL on the login form: previously we
-    # might click unrelated controls on a legitimate alternate landing page.
-    pass_field.press("Enter")
+    # Submit through the actual password form. Pressing Enter may bypass
+    # submit-button handlers, including validation on some site variants.
+    # Do not click other buttons (social sign-in or cookie consent).
+    login_form = pass_field.locator("xpath=ancestor::form[1]")
+    buttons = login_form.locator('button[type="submit"], input[type="submit"]')
+    submitted = False
+    for i in range(buttons.count()):
+        button = buttons.nth(i)
+        if button.is_visible():
+            button.click(timeout=15000)
+            submitted = True
+            break
+    if not submitted:
+        pass_field.press("Enter")
+
     try:
         page.wait_for_url("**/play**", timeout=15000)
     except Exception:
-        if page.locator('input[name="Password"]:visible').count():
-            blocker = sign_in_blocker(page)
-            if blocker:
-                raise RuntimeError(blocker)
-            for selector in ['button[type="submit"]', 'input[type="submit"]']:
-                try:
-                    buttons = page.locator(selector)
-                    for i in range(buttons.count()):
-                        button = buttons.nth(i)
-                        if button.is_visible():
-                            button.click(timeout=5000)
-                            raise StopIteration
-                except StopIteration:
-                    break
-                except Exception:
-                    pass
-            try:
-                page.wait_for_url("**/play**", timeout=10000)
-            except Exception:
-                # Some site variants land outside /play on success.
-                pass
+        # Some site variants land elsewhere. Check the form state below;
+        # never submit credentials a second time in the same attempt.
+        pass
 
     if page.locator('input[name="Password"]:visible').count():
         raise RuntimeError(sign_in_blocker(page) or "sign-in form remains visible after submission")
@@ -216,7 +209,7 @@ def run_once(state_path, user, password, screenshot):
                 if "exceeding recaptcha enterprise free quota" in body_text:
                     log("AUTH SITE ISSUE: geocaching.com reCAPTCHA Enterprise quota exceeded")
                 if "your password or username/email is incorrect" in body_text:
-                    log("AUTH LOGIN REJECTED: sign-in form reports incorrect credentials")
+                    log("AUTH LOGIN REJECTED: site reports incorrect credentials; verification challenge is also possible")
             except Exception:
                 pass
             try:
