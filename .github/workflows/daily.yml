@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: geosweep-daily
@@ -142,6 +143,7 @@ jobs:
           PYEOF
 
       - name: Publish database to rolling release
+        id: publish
         # Skip publish when initial authentication never completed, but keep
         # partial checkpoints from crawls that did start (including auth loss).
         if: always() && steps.dbcheck.outputs.valid == 'true' && steps.dbcheck.outputs.crawl_started == 'true'
@@ -172,5 +174,15 @@ jobs:
           gh release list --json tagName,createdAt \
             --jq '[.[] | select(.tagName | startswith("db-20")) | .tagName] | sort | .[:-7] | .[]' \
             | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # Chain only after the next run's checkpoint has been published.
+      # Transient auth or crawl failures fall back to the periodic schedule.
+      - name: Continue unfinished discovery
+        if: ${{ success() && steps.publish.outcome == 'success' && steps.dbcheck.outputs.valid == 'true' && steps.dbcheck.outputs.crawl_started == 'true' && steps.dbcheck.outputs.complete == 'false' }}
+        run: |
+          gh workflow run daily.yml --ref main
+          echo "Queued next discovery run"
         env:
           GH_TOKEN: ${{ github.token }}
