@@ -157,6 +157,7 @@ async function getTile(y,x) {
 }
 
 function updateMap(rows, coarse=false) {
+  if (!map || !map.getSource("caches")) return;
   byCode.clear();
   const features = [], flat = [];
   for (const r of rows) {
@@ -185,7 +186,7 @@ function updateMap(rows, coarse=false) {
 }
 
 async function refreshVisible() {
-  if (!meta || !map?.isStyleLoaded()) return;
+  if (!meta || !map || !map.getSource("caches")) return;
   const current = ++revision;
   const q = $("search").value.trim().toLowerCase();
   searchTerm = q.length >= 3 ? q : "";
