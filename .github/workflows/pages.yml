@@ -1,0 +1,80 @@
+name: pages
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 9 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "scripts/export_web.py"
+      - ".github/workflows/pages.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: geosweep-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+
+      - name: Restore latest crawl database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          gh release download db-latest -p geosweep.db.zst --clobber
+          zstd -dc geosweep.db.zst -o data/geosweep.db
+          rm geosweep.db.zst
+          ls -lh data/geosweep.db
+
+      - name: Export geocaches for viewer
+        run: |
+          rm -rf web/data
+          python3 scripts/export_web.py --db data/geosweep.db --out web/data
+          touch web/.nojekyll
+          du -sh web web/data
+
+      - name: Verify site payload
+        run: |
+          test -s web/index.html
+          test -s web/app.js
+          test -s web/data/index.json
+          test -s web/data/catalog.json.gz
+          test -n "$(find web/data/tiles -name '*.json.gz' -print -quit)"
+          bytes=$(du -sb web | cut -f1)
+          echo "GitHub Pages payload: $bytes bytes"
+          test "$bytes" -lt 1000000000
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: web
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
