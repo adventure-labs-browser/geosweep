@@ -32,5 +32,26 @@ cargo run --release -- --db data/geosweep.db stats
 cargo run --release -- --db data/geosweep.db verify
 ```
 
-Automation: private repo + daily GitHub Action, DB in a rolling
-`db-latest` release (+ 7 dated backups).
+Automation: a GitHub Action with automatic checkpoint-to-checkpoint
+continuation, DB in a rolling `db-latest` release (+ 7 dated backups).
+
+## Web viewer
+
+The `web/` static viewer adapts LabSweep's sidebar and MapLibre map for
+geocaches: world density, clusters/heat/points, nearby browsing, search by
+GC code/name/owner, difficulty/terrain filters, basic cache metadata, and
+Geocaching.com links. LabSweep-specific stages, reviews, ratings, and
+adventure history are intentionally removed.
+
+Generate data locally with:
+
+```sh
+python3 scripts/export_web.py --db data/geosweep.db --out web/data
+python3 -m http.server --directory web 8000
+```
+
+The Pages workflow exports from the latest rolling database once daily
+or on demand. Individual cache locations are loaded as geographic shards
+when zooming in. Worldwide text search loads a compressed catalog on
+demand. Premium caches lacking coordinates are searchable by unchecking
+the coordinates filter.
