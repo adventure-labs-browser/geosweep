@@ -11,7 +11,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: python3 -m py_compile .github/scripts/gc-login.py
+      - run: python3 -m py_compile .github/scripts/gc-login.py scripts/export_web.py
+      - run: python3 scripts/test_export_web.py
+      - run: node --check web/app.js
       - run: cargo check --locked --all-targets
       - run: cargo test --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
