@@ -52,6 +52,8 @@ python3 -m http.server --directory web 8000
 
 The Pages workflow exports from the latest rolling database once daily
 or on demand. Individual cache locations are loaded as geographic shards
-when zooming in. Worldwide text search loads a compressed catalog on
-demand. Premium caches lacking coordinates are searchable by unchecking
+when zooming in. Points mode uses a WebGL renderer with a fast worldwide
+preview followed by the complete coordinate-only binary. Zooming out
+never replaces individual points with clusters. Worldwide text search
+loads a compressed catalog on demand. Premium caches lacking coordinates are searchable by unchecking
 the coordinates filter.

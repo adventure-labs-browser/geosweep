@@ -14,6 +14,8 @@ jobs:
       - run: python3 -m py_compile .github/scripts/gc-login.py scripts/export_web.py
       - run: python3 scripts/test_export_web.py
       - run: node --check web/app.js
+      - run: node --check web/points.js
+      - run: node --test scripts/test_points.mjs
       - run: cargo check --locked --all-targets
       - run: cargo test --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings

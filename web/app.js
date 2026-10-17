@@ -16,6 +16,7 @@ const MAX_TILES = 20, MAX_MARKERS = 15000, MAX_LIST = 250;
 let meta, map, mode = "cluster", sort = "f", selected = null;
 let visible = [], shown = [], hitCount = 0, revision = 0;
 let searchCatalog = null, searchPromise = null, searchTerm = "";
+let globalPointsPromise = null;
 const cache = new Map();
 const byCode = new Map();
 const empty = {type:"FeatureCollection",features:[]};
@@ -156,33 +157,98 @@ async function getTile(y,x) {
   return result;
 }
 
+async function ensureGlobalPoints() {
+  if (GeoSweepPoints.globalComplete || globalPointsPromise) return;
+  $("mapnote").textContent = "Loading worldwide points…";
+  const fetchBinary = async name => {
+    const response = await fetch("data/" + name);
+    if (!response.ok) throw new Error(name + " (" + response.status + ")");
+    if (!response.body || typeof DecompressionStream === "undefined")
+      throw new Error("Browser does not support gzip streams");
+    return new Response(response.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+  };
+  globalPointsPromise = (async () => {
+    // Start the full download immediately; a small sampled binary gives the
+    // user individual points rather than clusters while it completes.
+    const full = fetchBinary("points.bin.gz");
+    try {
+      const sample = await fetchBinary("points-preview.bin.gz");
+      if (!GeoSweepPoints.globalReady) {
+        GeoSweepPoints.setGlobal(sample);
+        if (mode === "all" && map.getZoom() < 6 && !searchTerm)
+          $("mapnote").textContent = "Showing individual points · loading full set…";
+      }
+    } catch (error) { console.warn("Point preview unavailable", error); }
+    GeoSweepPoints.setGlobal(await full);
+    GeoSweepPoints.globalComplete = true;
+    if (mode === "all" && map && map.getZoom() < 6 && !searchTerm)
+      $("mapnote").textContent = number(GeoSweepPoints.globalCount) + " individual points";
+  })().catch(error => {
+    globalPointsPromise = null;
+    if (mode === "all") $("mapnote").textContent = "Points unavailable: " + error.message;
+    console.error(error);
+  });
+}
+
 function updateMap(rows, coarse=false) {
   if (!map || !map.getSource("caches")) return;
-  byCode.clear();
-  const features = [], flat = [];
-  for (const r of rows) {
-    if (r[2] == null || r[3] == null) continue;
-    if (features.length >= MAX_MARKERS) break;
-    byCode.set(r[0],r);
-    const f = feature(r[3],r[2],{g:r[0],type:r[4]});
-    features.push(f);
-    flat.push(f);
-  }
-  map.getSource("caches").setData({type:"FeatureCollection",features});
-  map.getSource("flat").setData({type:"FeatureCollection",features:flat});
   const low = coarse || (map.getZoom() < 6 && !searchTerm);
-  const visibleLayer = id => {
-    if (id === "density-circles" || id === "density-count") return low && mode !== "heat";
-    if (id === "density-heat") return low && mode === "heat";
+  const displayDensity = low && !searchTerm;
+  const layerVisible = id => {
+    if (id === "density-circles" || id === "density-count")
+      return displayDensity && mode === "cluster";
+    if (id === "density-heat") return displayDensity && mode === "heat";
     if (id === "clusters" || id === "cluster-count" || id === "points")
-      return !low && mode === "cluster";
-    if (id === "flat-heat") return !low && mode === "heat";
-    if (id === "flat-points") return !low && mode === "all";
+      return !displayDensity && mode === "cluster";
+    if (id === "flat-heat") return !displayDensity && mode === "heat";
     return false;
   };
   for (const id of ["density-circles","density-count","density-heat",
     "clusters","cluster-count","points","flat-heat","flat-points"])
-    map.setLayoutProperty(id,"visibility",visibleLayer(id)?"visible":"none");
+    map.setLayoutProperty(id,"visibility",layerVisible(id)?"visible":"none");
+
+  GeoSweepPoints.visible = mode === "all";
+  GeoSweepPoints.setFilters(+$("ftype").value || 0,
+    num($("fminD").value) || 0, num($("fminT").value) || 0);
+  if (mode === "all") {
+    GeoSweepPoints.scope = displayDensity ? "global" : "local";
+    if (displayDensity) ensureGlobalPoints();
+    else GeoSweepPoints.setLocal(rows);
+    map.triggerRepaint();
+    return;
+  }
+
+  // Never build/parse the heavyweight GeoJSON sources in Points mode.
+  // Cluster and heatmap data is limited to the visible map bounds.
+  const features = [];
+  byCode.clear();
+  for (const r of rows) {
+    if (r[2] == null || r[3] == null) continue;
+    if (features.length >= MAX_MARKERS) break;
+    byCode.set(r[0],r);
+    features.push(feature(r[3],r[2],{g:r[0],type:r[4]}));
+  }
+  const geo = {type:"FeatureCollection",features};
+  if (mode === "cluster") map.getSource("caches").setData(geo);
+  else if (mode === "heat") map.getSource("flat").setData(geo);
+}
+
+function nearestVisiblePoint(e) {
+  if (mode !== "all" || map.getZoom() < 6 || !visible.length) return;
+  const tl = map.unproject([e.point.x - 10, e.point.y - 10]);
+  const br = map.unproject([e.point.x + 10, e.point.y + 10]);
+  const minLat = Math.min(tl.lat,br.lat), maxLat = Math.max(tl.lat,br.lat);
+  let nearest = null, distance = 100; // maximum 10px click radius
+  for (const r of visible) {
+    if (r[2] == null || r[3] == null || r[2] < minLat || r[2] > maxLat) continue;
+    if (![r[3],r[3]+360,r[3]-360].some(lng => lng >= tl.lng && lng <= br.lng))
+      continue;
+    const pos = map.project([r[3],r[2]]);
+    const dx = pos.x-e.point.x, dy = pos.y-e.point.y;
+    const d = dx*dx + dy*dy;
+    if (d < distance) { nearest=r; distance=d; }
+  }
+  if (nearest) openDetail(nearest,false);
 }
 
 async function refreshVisible() {
@@ -223,7 +289,10 @@ async function refreshVisible() {
   if (map.getZoom() < 6) {
     visible = [];shown=[];hitCount=0;
     updateMap([],true);
-    $("mapnote").textContent = "Zoom in to see individual geocaches";
+    $("mapnote").textContent = mode === "all" ?
+      (GeoSweepPoints.globalComplete ? number(GeoSweepPoints.globalCount) + " individual points" :
+       GeoSweepPoints.globalReady ? "Showing individual points · loading full set…" :
+       "Loading worldwide points…") : "Zoom in to browse geocaches";
     renderList();
     return;
   }
@@ -231,7 +300,8 @@ async function refreshVisible() {
   if (tiles.length > MAX_TILES) {
     visible=[];shown=[];hitCount=0;
     updateMap([],true);
-    $("mapnote").textContent = "Zoom in to load individual caches";
+    $("mapnote").textContent = mode === "all" ?
+      "Using worldwide point renderer; zoom in for details" : "Zoom in to load individual caches";
     renderList();
     return;
   }
@@ -252,11 +322,12 @@ async function refreshVisible() {
   }
   visible=rows;
   hitCount=rows.length;
-  shown=sorted(rows.slice());
-  updateMap(shown,false);
-  $("mapnote").textContent = rows.length > MAX_MARKERS ?
+  // Avoid sorting tens of thousands of records just to display 250 items.
+  shown=sorted(rows.slice(0, Math.max(MAX_LIST * 8, MAX_LIST)));
+  updateMap(rows,false);
+  $("mapnote").textContent = rows.length > MAX_MARKERS && mode !== "all" ?
     "Showing " + number(MAX_MARKERS) + " of " + number(rows.length) +
-    " map points · zoom closer for detail" : number(rows.length) + " caches in view";
+    " map markers · zoom closer for detail" : number(rows.length) + " caches in view";
   renderList();
 }
 
@@ -306,6 +377,7 @@ function initMap() {
         "circle-stroke-width":.6,"circle-stroke-color":"#0d1117"}});
     map.addLayer({id:"flat-heat",type:"heatmap",source:"flat",layout:{visibility:"none"},
       paint:{"heatmap-radius":16,"heatmap-intensity":1.3,"heatmap-opacity":.85}});
+    map.addLayer(GeoSweepPoints);
     map.addSource("selected",{type:"geojson",data:empty});
     map.addLayer({id:"selected-point",type:"circle",source:"selected",
       paint:{"circle-color":"#d29922","circle-radius":9,
@@ -330,6 +402,7 @@ function initMap() {
       map.on("mouseenter",layer,() => map.getCanvas().style.cursor="pointer");
       map.on("mouseleave",layer,() => map.getCanvas().style.cursor="");
     }
+    map.on("click",nearestVisiblePoint);
     map.on("moveend",refreshVisible);
     refreshVisible();
   });
@@ -354,7 +427,7 @@ function bindUi() {
     button.onclick=() => {
       mode=button.dataset.mode;
       document.querySelectorAll("#mapmode button").forEach(b=>b.classList.toggle("on",b===button));
-      updateMap(shown,map.getZoom()<6 || $("mapnote").textContent.startsWith("Zoom in"));
+      updateMap(visible,map.getZoom()<6 && !searchTerm);
     });
   $("fit").onclick=() => map.flyTo({center:[10,30],zoom:1.6});
   $("random").onclick=() => {
