@@ -1,3 +1,4 @@
+import struct
 import gzip
 from pathlib import Path
 import sqlite3
@@ -44,6 +45,18 @@ class ExportWebTests(unittest.TestCase):
             self.assertEqual(info["premium"], 1)
             self.assertEqual(info["worldwide"], 4)
             self.assertEqual(info["pending"], 1)
+            with gzip.open(out / "points.bin.gz", "rb") as f:
+                packed = f.read()
+            with gzip.open(out / "points-preview.bin.gz", "rb") as f:
+                sample = f.read()
+            self.assertEqual(len(packed), 2 * 12)
+            self.assertEqual(len(sample), 12)
+            west = struct.unpack_from("<ffHBB", packed, 0)
+            east = struct.unpack_from("<ffHBB", packed, 12)
+            self.assertAlmostEqual(west[0], 0)
+            self.assertAlmostEqual(east[0], 1)
+            self.assertEqual(west[2:], (2, 3, 4))
+            self.assertEqual(east[2:], (3, 4, 6))
             self.assertEqual(sorted(info["tiles"]), [[0,0,1],[35,71,1]])
             with gzip.open(out / "catalog.json.gz", "rt", encoding="utf-8") as f:
                 catalog = json.load(f)

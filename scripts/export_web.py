@@ -5,6 +5,8 @@ from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 import gzip
 import json
+import math
+import struct
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -29,7 +31,8 @@ def export(db_path: Path, output: Path):
 
     with tempfile.TemporaryDirectory(prefix="geosweep-tiles-") as temp, gzip.open(
         output / "catalog.json.gz", "wt", encoding="utf-8", compresslevel=5
-    ) as catalog:
+    ) as catalog, gzip.open(output / "points.bin.gz", "wb", compresslevel=5) as points, \
+         gzip.open(output / "points-preview.bin.gz", "wb", compresslevel=5) as preview:
         temp_path = Path(temp)
         catalog.write("[")
         first = True
@@ -48,6 +51,19 @@ def export(db_path: Path, output: Path):
                 totals["coordless"] += 1
                 continue
             totals["located"] += 1
+            # Direct-to-GPU binary stream: mercator x/y, type, difficulty/terrain x2.
+            phi = math.radians(max(-85.051129, min(85.051129, lat)))
+            mx = (lon + 180) / 360
+            my = (1 - math.log(math.tan(math.pi / 4 + phi / 2)) / math.pi) / 2
+            packed = struct.pack("<ffHBB", mx, my,
+                int(record[4] or 0) & 0xffff,
+                max(0, min(255, round((record[5] or 0) * 2))),
+                max(0, min(255, round((record[6] or 0) * 2))))
+            points.write(packed)
+            # Draw real individual caches immediately at world zoom while
+            # the complete coordinate-only binary loads in the background.
+            if totals["located"] % 12 == 1:
+                preview.write(packed)
             y = min(35, max(0, int((lat + 90) // 5)))
             x = min(71, max(0, int((lon + 180) // 5)))
             tile = f"{y}-{x}"

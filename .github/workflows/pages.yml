@@ -62,6 +62,8 @@ jobs:
           test -s web/app.js
           test -s web/data/index.json
           test -s web/data/catalog.json.gz
+          test -s web/data/points.bin.gz
+          test -s web/data/points-preview.bin.gz
           test -n "$(find web/data/tiles -name '*.json.gz' -print -quit)"
           bytes=$(du -sb web | cut -f1)
           echo "GitHub Pages payload: $bytes bytes"
