@@ -204,6 +204,52 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse(any(f"db-snapshot-202610{day:02d}-" in r for r in kept))
         self.assertNotIn("db-snapshot-20261019-2-1", kept)
 
+    def test_retention_handles_drafts_and_numeric_order(self):
+        releases = [
+            {"tagName": "db-snapshot-20261020-9-1", "isDraft": False, "createdAt": "later"},
+            {"tagName": "db-snapshot-20261020-10-1", "isDraft": False, "createdAt": "earlier"},
+            {"tagName": "db-snapshot-20261020-99-1", "isDraft": True, "createdAt": "newest"},
+            {"tagName": "db-snapshot-20261019-7-1", "isDraft": False},
+            {"tagName": "db-snapshot-20261018-8-1", "isDraft": False},
+        ]
+        removed = snapshot.snapshots_to_prune(
+            releases, current="db-snapshot-20261020-10-1",
+            previous="db-snapshot-20261020-9-1", keep=2)
+        self.assertIn("db-snapshot-20261020-99-1", removed)
+        self.assertIn("db-snapshot-20261018-8-1", removed)
+        self.assertNotIn("db-snapshot-20261020-10-1", removed)
+        self.assertNotIn("db-snapshot-20261020-9-1", removed)
+        self.assertNotIn("db-snapshot-20261019-7-1", removed)
+
+    def test_local_disk_write_failure_cleans_up_decompressor(self):
+        import threading
+        source_open = Path.open
+        destination = self.root / "write-failure.db"
+        self.build()
+        manifest = snapshot.parse_manifest(self.parts)
+        parts = [self.parts / p["name"] for p in manifest["parts"]]
+
+        class FailingOutput:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def write(self, block):
+                raise OSError("simulated full disk")
+
+        def open_hook(path, mode="r", *args, **kwargs):
+            if path == destination and mode == "wb":
+                return FailingOutput()
+            return source_open(path, mode, *args, **kwargs)
+
+        previous_threads = {t.ident for t in threading.enumerate()}
+        with patch.object(Path, "open", autospec=True, side_effect=open_hook):
+            with self.assertRaisesRegex(OSError, "simulated full disk"):
+                snapshot.decompress_verified(parts, destination,
+                    manifest["database_bytes"], manifest["database_sha256"])
+        self.assertFalse([t for t in threading.enumerate()
+                          if t.ident not in previous_threads and t.is_alive() and not t.daemon])
+
     def test_remote_digest_mismatch_rejected(self):
         manifest = self.build()
         expected = [snapshot.MANIFEST, *[p["name"] for p in manifest["parts"]]]
