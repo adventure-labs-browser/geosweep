@@ -25,14 +25,9 @@ jobs:
 
       - name: Restore database from rolling release
         run: |
-          mkdir -p data
-          if gh release download db-latest -p 'geosweep.db.zst' --clobber; then
-            zstd -dc geosweep.db.zst -o data/geosweep.db
-            rm -f geosweep.db.zst
-            ls -lh data/geosweep.db
-          else
-            echo "no db-latest release yet — starting from an empty database"
-          fi
+          # Fail closed on missing/unavailable/corrupt checkpoints; never
+          # interpret a GitHub/network error as an empty first-run database.
+          python3 scripts/snapshot.py fetch-latest data/geosweep.db
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -148,32 +143,11 @@ jobs:
         # partial checkpoints from crawls that did start (including auth loss).
         if: always() && steps.dbcheck.outputs.valid == 'true' && steps.dbcheck.outputs.crawl_started == 'true'
         run: |
-          zstd -T0 data/geosweep.db -o /tmp/geosweep.db.zst
-          ls -lh /tmp/geosweep.db.zst
-          TAG="db-$(date -u +%F)"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" /tmp/geosweep.db.zst --clobber
-            gh release edit "$TAG" \
-              --title "geosweep db $(date -u +%F)" \
-              --notes "Dated snapshot/checkpoint, kept 7 days."
-          else
-            gh release create "$TAG" /tmp/geosweep.db.zst \
-              --title "geosweep db $(date -u +%F)" \
-              --notes "Dated snapshot/checkpoint, kept 7 days."
-          fi
-          if gh release view db-latest >/dev/null 2>&1; then
-            gh release upload db-latest /tmp/geosweep.db.zst --clobber
-            gh release edit db-latest \
-              --title "geosweep db $(date -u +%F)" \
-              --notes "Rolling database snapshot/checkpoint. Incomplete discovery resumes from saved page/cell checkpoints."
-          else
-            gh release create db-latest /tmp/geosweep.db.zst \
-              --title "geosweep db $(date -u +%F)" \
-              --notes "Rolling database snapshot/checkpoint. Incomplete discovery resumes from saved page/cell checkpoints."
-          fi
-          gh release list --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("db-20")) | .tagName] | sort | .[:-7] | .[]' \
-            | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
+          # Level-10 zstd, at most 1 GiB per asset. Upload an immutable
+          # checkpoint, validate GitHub's asset SHA-256 digests, and only then
+          # atomically switch db-latest's release-body pointer. Legacy single-
+          # asset backups remain readable during the migration.
+          python3 scripts/snapshot.py publish data/geosweep.db
         env:
           GH_TOKEN: ${{ github.token }}
 
