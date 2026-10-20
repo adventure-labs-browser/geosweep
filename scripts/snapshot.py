@@ -326,11 +326,26 @@ def fetch_latest(destination: Path) -> None:
             restore(scratch, destination, legacy=True)
 
 
+def snapshots_to_prune(releases: list[dict], *, current: str,
+                       previous: str | None, keep: int) -> list[str]:
+    """Prune repeat runs, preserving one snapshot from each of 7 UTC dates."""
+    ordered = [r["tagName"] for r in sorted(releases, key=lambda r: r["createdAt"], reverse=True)
+               if TAG_PATTERN.fullmatch(r["tagName"])]
+    protected = {current, previous} - {None}
+    newest_each_day = {}
+    for release_tag in ordered:
+        day = release_tag.removeprefix("db-snapshot-")[:8]
+        if day not in newest_each_day:
+            newest_each_day[day] = release_tag
+    to_keep = set(list(newest_each_day.values())[:keep]) | protected
+    return [release_tag for release_tag in ordered if release_tag not in to_keep]
+
+
 def publish(db: Path, *, run_id: str, attempt: str, keep: int = 7) -> str:
     if not run_id.isdecimal() or not attempt.isdecimal():
         raise SnapshotError("GitHub run id and attempt must be numeric")
     if keep < 2:
-        raise SnapshotError("at least two immutable snapshots must be retained")
+        raise SnapshotError("at least two dated backups must be retained")
     # Require the existing pointer before creating any new backup. No automatic
     # bootstrap or restoration from zero on an API error.
     latest = release_info("db-latest")
@@ -357,16 +372,11 @@ def publish(db: Path, *, run_id: str, attempt: str, keep: int = 7) -> str:
     # Deletion is best-effort, and never runs until the new pointer is checked.
     try:
         snapshots = json.loads(gh("release", "list", "--limit", "200", "--json", "tagName,createdAt"))
-        ordered = [r["tagName"] for r in sorted(snapshots, key=lambda r: r["createdAt"], reverse=True)
-                   if TAG_PATTERN.fullmatch(r["tagName"])]
-        protected = {tag, previous} - {None}
-        to_keep = set(ordered[:keep]) | protected
-        for obsolete in ordered:
-            if obsolete not in to_keep:
-                try:
-                    gh("release", "delete", obsolete, "-y", "--cleanup-tag")
-                except SnapshotError as exc:
-                    print(f"Warning: could not prune {obsolete}: {exc}", file=sys.stderr)
+        for obsolete in snapshots_to_prune(snapshots, current=tag, previous=previous, keep=keep):
+            try:
+                gh("release", "delete", obsolete, "-y", "--cleanup-tag")
+            except SnapshotError as exc:
+                print(f"Warning: could not prune {obsolete}: {exc}", file=sys.stderr)
     except (SnapshotError, ValueError, KeyError) as exc:
         print(f"Warning: snapshot pruning skipped: {exc}", file=sys.stderr)
     return tag

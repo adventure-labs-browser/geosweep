@@ -71,7 +71,8 @@ The workflow checks GitHub's uploaded-asset SHA-256 digests before publishing
 that draft release. It then updates the body of the existing `db-latest` release
 with a pointer to the new snapshot. This single metadata update is the
 promotion step: an incomplete upload never replaces the last good checkpoint.
-At least the most recent seven immutable snapshots are retained. The old
+The newest backup on each of the last seven distinct UTC dates, plus the
+immediately previous checkpoint, is retained. The old
 `geosweep.db.zst` release asset is left untouched, and restore supports it
 for backwards compatibility.
 

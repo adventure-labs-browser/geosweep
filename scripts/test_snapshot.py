@@ -185,6 +185,25 @@ class SnapshotTests(unittest.TestCase):
             snapshot.fetch_latest(destination)
         self.assertEqual(self.db.read_bytes(), destination.read_bytes())
 
+    def test_retention_preserves_seven_dated_backups_and_previous(self):
+        releases = []
+        for day in range(10, 20):
+            for run in (1, 2, 3, 4):
+                releases.append({"tagName": f"db-snapshot-202610{day:02d}-{run}-1",
+                                 "createdAt": f"2026-10-{day:02d}T{run:02d}:00:00Z"})
+        current = "db-snapshot-20261019-4-1"
+        previous = "db-snapshot-20261019-3-1"
+        removed = snapshot.snapshots_to_prune(releases, current=current, previous=previous, keep=7)
+        kept = {r["tagName"] for r in releases} - set(removed)
+        self.assertIn(current, kept)
+        self.assertIn(previous, kept)
+        # Preserve one dated checkpoint for Oct 13–19.
+        for day in range(13, 20):
+            self.assertIn(f"db-snapshot-202610{day:02d}-4-1", kept)
+        for day in range(10, 13):
+            self.assertFalse(any(f"db-snapshot-202610{day:02d}-" in r for r in kept))
+        self.assertNotIn("db-snapshot-20261019-2-1", kept)
+
     def test_remote_digest_mismatch_rejected(self):
         manifest = self.build()
         expected = [snapshot.MANIFEST, *[p["name"] for p in manifest["parts"]]]
