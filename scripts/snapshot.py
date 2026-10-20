@@ -202,28 +202,37 @@ def decompress_verified(parts: list[Path], tmp_path: Path, expected_bytes: int |
             if proc.stdin:
                 proc.stdin.close()
 
-    writer = threading.Thread(target=feed)
+    # A failed local write must not leave a non-daemon feed thread blocked on
+    # zstd's stdin. Always terminate the child before joining the feed thread.
+    writer = threading.Thread(target=feed, daemon=True)
     writer.start()
     count = 0
     digest = hashlib.sha256()
     assert proc.stdout is not None
-    with tmp_path.open("wb") as out:
-        for block in iter(lambda: proc.stdout.read(1024 * 1024), b""):
-            out.write(block)
-            digest.update(block)
-            count += len(block)
-    writer.join()
-    assert proc.stderr is not None
-    stderr = proc.stderr.read().decode(errors="replace")
-    result = proc.wait()
-    proc.stdout.close()
-    proc.stderr.close()
-    if result or feed_error:
-        raise SnapshotError(f"zstd extraction failed: {stderr[-500:]} {feed_error}")
-    if expected_bytes is not None and count != expected_bytes:
-        raise SnapshotError("restored SQLite size mismatch")
-    if expected_hash is not None and digest.hexdigest() != expected_hash:
-        raise SnapshotError("restored SQLite hash mismatch")
+    try:
+        with tmp_path.open("wb") as out:
+            for block in iter(lambda: proc.stdout.read(1024 * 1024), b""):
+                out.write(block)
+                digest.update(block)
+                count += len(block)
+        writer.join()
+        assert proc.stderr is not None
+        stderr = proc.stderr.read().decode(errors="replace")
+        result = proc.wait()
+        if result or feed_error:
+            raise SnapshotError(f"zstd extraction failed: {stderr[-500:]} {feed_error}")
+        if expected_bytes is not None and count != expected_bytes:
+            raise SnapshotError("restored SQLite size mismatch")
+        if expected_hash is not None and digest.hexdigest() != expected_hash:
+            raise SnapshotError("restored SQLite hash mismatch")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        writer.join(timeout=5)
+        proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
 
 
 def restore(directory: Path, destination: Path, *, legacy: bool = False) -> None:
@@ -328,17 +337,26 @@ def fetch_latest(destination: Path) -> None:
 
 def snapshots_to_prune(releases: list[dict], *, current: str,
                        previous: str | None, keep: int) -> list[str]:
-    """Prune repeat runs, preserving one snapshot from each of 7 UTC dates."""
-    ordered = [r["tagName"] for r in sorted(releases, key=lambda r: r["createdAt"], reverse=True)
-               if TAG_PATTERN.fullmatch(r["tagName"])]
+    """Keep one published backup per UTC day; clear old incomplete drafts."""
+    def snapshot_sort_key(entry: dict) -> tuple[int, int, int]:
+        match = TAG_PATTERN.fullmatch(entry["tagName"])
+        assert match is not None
+        day, run, attempt = entry["tagName"].split("-")[2:]
+        return int(day), int(run), int(attempt)
+
+    ordered = sorted((r for r in releases if TAG_PATTERN.fullmatch(r["tagName"])),
+                     key=snapshot_sort_key, reverse=True)
     protected = {current, previous} - {None}
     newest_each_day = {}
-    for release_tag in ordered:
-        day = release_tag.removeprefix("db-snapshot-")[:8]
+    for release in ordered:
+        if release.get("isDraft", False):
+            continue
+        tag = release["tagName"]
+        day = tag.split("-")[2]
         if day not in newest_each_day:
-            newest_each_day[day] = release_tag
+            newest_each_day[day] = tag
     to_keep = set(list(newest_each_day.values())[:keep]) | protected
-    return [release_tag for release_tag in ordered if release_tag not in to_keep]
+    return [r["tagName"] for r in ordered if r["tagName"] not in to_keep]
 
 
 def publish(db: Path, *, run_id: str, attempt: str, keep: int = 7) -> str:
@@ -371,7 +389,7 @@ def publish(db: Path, *, run_id: str, attempt: str, keep: int = 7) -> str:
         print(f"Promoted {tag} to db-latest", flush=True)
     # Deletion is best-effort, and never runs until the new pointer is checked.
     try:
-        snapshots = json.loads(gh("release", "list", "--limit", "200", "--json", "tagName,createdAt"))
+        snapshots = json.loads(gh("release", "list", "--limit", "200", "--json", "tagName,isDraft"))
         for obsolete in snapshots_to_prune(snapshots, current=tag, previous=previous, keep=keep):
             try:
                 gh("release", "delete", obsolete, "-y", "--cleanup-tag")
