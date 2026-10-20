@@ -11,8 +11,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: python3 -m py_compile .github/scripts/gc-login.py scripts/export_web.py
+      - run: python3 -m py_compile .github/scripts/gc-login.py scripts/export_web.py scripts/snapshot.py
       - run: python3 scripts/test_export_web.py
+      - run: python3 -m unittest discover -s scripts -p "test_snapshot.py" -v
       - run: node --check web/app.js
       - run: node --check web/points.js
       - run: node --test scripts/test_points.mjs

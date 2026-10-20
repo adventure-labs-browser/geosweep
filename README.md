@@ -57,3 +57,38 @@ preview followed by the complete coordinate-only binary. Zooming out
 never replaces individual points with clusters. Worldwide text search
 loads a compressed catalog on demand. Premium caches lacking coordinates are searchable by unchecking
 the coordinates filter.
+
+## Database checkpoint storage
+
+The crawler continues using an ordinary SQLite database. The daily workflow
+validates the database, checkpoints the WAL, and calls `scripts/snapshot.py`
+to compress at Zstandard level 10. Compression is performed as a stream and
+split into **1 GiB release assets**, with a JSON manifest containing per-part,
+compressed-stream, and original-database SHA-256 checksums.
+
+Each job publishes a new immutable `db-snapshot-YYYYMMDD-RUN-ATTEMPT` release.
+The workflow checks GitHub's uploaded-asset SHA-256 digests before publishing
+that draft release. It then updates the body of the existing `db-latest` release
+with a pointer to the new snapshot. This single metadata update is the
+promotion step: an incomplete upload never replaces the last good checkpoint.
+At least the most recent seven immutable snapshots are retained. The old
+`geosweep.db.zst` release asset is left untouched, and restore supports it
+for backwards compatibility.
+
+Restores download the referenced release, verify all checksums, decompress to
+a temporary file, and verify the SQLite database before replacing the target.
+A missing release, network failure, or corrupt snapshot is a **hard failure**,
+not permission to silently create a fresh database. Initial bootstrap needs a
+separately provisioned checkpoint.
+
+Offline packaging/round-trip commands:
+
+```sh
+python3 scripts/snapshot.py pack data/geosweep.db /tmp/geosweep-parts
+python3 scripts/snapshot.py verify /tmp/geosweep-parts
+python3 scripts/snapshot.py restore /tmp/geosweep-parts /tmp/geosweep-restored.db
+python3 -m unittest discover -s scripts -p test_snapshot.py -v
+```
+
+Don't publish multiple snapshots concurrently: the scheduled GitHub workflow
+already serializes runs with its existing concurrency group.
