@@ -1,7 +1,7 @@
 name: daily
 on:
   schedule:
-    - cron: "17 1,7,13,19 * * *"
+    - cron: "17 1 * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    # Cron cannot express "every 2 days". The schedule fires daily and this
+    # gate admits only even epoch days (UTC), giving a strict 48h cadence
+    # (e.g. Nov 13, Nov 15, ...). Manual dispatches always run.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.parity.outputs.run }}
+    steps:
+      - id: parity
+        run: |
+          d=$(( $(date -u +%s) / 86400 ))
+          if [ $((d % 2)) -eq 0 ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "run=false" >> "$GITHUB_OUTPUT"; fi
   refresh:
+    needs: gate
+    if: github.event_name != 'schedule' || needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -151,12 +165,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      # Chain only after the next run's checkpoint has been published.
-      # Transient auth or crawl failures fall back to the periodic schedule.
-      - name: Continue unfinished discovery
-        if: ${{ success() && steps.publish.outcome == 'success' && steps.dbcheck.outputs.valid == 'true' && steps.dbcheck.outputs.crawl_started == 'true' && steps.dbcheck.outputs.complete == 'false' }}
-        run: |
-          gh workflow run daily.yml --ref main
-          echo "Queued next discovery run"
-        env:
-          GH_TOKEN: ${{ github.token }}
